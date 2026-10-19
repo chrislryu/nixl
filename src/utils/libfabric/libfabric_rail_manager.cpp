@@ -920,6 +920,11 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                 // memory (e.g. GB200)
                 want_pcie_mapping =
                     topology->nicSharesPcieSwitchWithAccel(rails_[rail_idx]->device_name);
+                // Proof of concept only, not for upstream: answer as on g6, where no NIC shares a
+                // PCIe switch with a GPU
+                if (getenv("NIXL_POC_AUTO_ASSUME_DEFAULT_MAPPING")) {
+                    want_pcie_mapping = false;
+                }
                 break;
             case DmabufMappingMode::Off:
                 break;
