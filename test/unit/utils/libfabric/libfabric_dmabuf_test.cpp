@@ -76,6 +76,31 @@ checkCase(const AlignCase &test_case) {
     return rc;
 }
 
+struct ServeCase {
+    const char *name;
+    bool auto_mode;
+    bool want_pcie_mapping;
+    int fd;
+    bool export_pcie_mapping;
+    bool expected;
+};
+
+int
+checkServeCase(const ServeCase &test_case) {
+    LibfabricUtils::CudaDmabufExport entry;
+    entry.fd = test_case.fd;
+    entry.pcie_mapping = test_case.export_pcie_mapping;
+    const bool serves = LibfabricUtils::cudaDmabufServesRegistration(
+        test_case.auto_mode, test_case.want_pcie_mapping, entry);
+    if (serves != test_case.expected) {
+        NIXL_ERROR << test_case.name << ": expected registration "
+                   << (test_case.expected ? "with FI_MR_DMABUF" : "by virtual address")
+                   << ", got " << (serves ? "FI_MR_DMABUF" : "virtual address");
+        return 1;
+    }
+    return 0;
+}
+
 } // namespace
 
 int
@@ -109,5 +134,32 @@ main() {
         NIXL_INFO << "   SUCCESS: dmabuf export ranges are page aligned, cover the region, and "
                      "reproduce the buffer address from base + offset";
     }
-    return rc;
+
+    NIXL_INFO << "=== Testing which CUDA registrations carry the dmabuf export ===";
+
+    const ServeCase serve_cases[] = {
+        // Auto: only a granted PCIe mapping changes the window, so only it carries the export
+        {"auto, PCIe wanted and granted", true, true, 7, true, true},
+        {"auto, PCIe wanted but refused (e.g. p6-b200 driver)", true, true, 7, false, false},
+        {"auto, default wanted (e.g. g6, p4d, GB200 Grace NICs)", true, false, 7, false, false},
+        {"auto, default wanted, no export made", true, false, -1, false, false},
+        {"auto, PCIe wanted, export failed", true, true, -1, false, false},
+        // Forced mapping types are honored whenever the export carries them
+        {"forced PCIe, granted", false, true, 7, true, true},
+        {"forced PCIe, refused", false, true, 7, false, false},
+        {"forced default", false, false, 7, false, true},
+        {"forced default, export failed", false, false, -1, false, false},
+    };
+
+    int serve_rc = 0;
+    for (const auto &test_case : serve_cases) {
+        if (checkServeCase(test_case) != 0) {
+            serve_rc = 1;
+        }
+    }
+    if (serve_rc == 0) {
+        NIXL_INFO << "   SUCCESS: Auto carries the export only for a granted PCIe mapping, and "
+                     "forced mapping types whenever the export carries them";
+    }
+    return rc | serve_rc;
 }

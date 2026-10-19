@@ -58,6 +58,30 @@ cudaDmabufAlignRange(const void *buffer,
 }
 
 /**
+ * @brief Decides whether a CUDA registration carries its dmabuf export or registers by
+ * virtual address.
+ * @note A virtual-address registration keeps the GDRCopy mapping the EFA RDM provider skips
+ * for an FI_MR_DMABUF registration, so in Auto the export serves only the registrations whose
+ * mapping type it changes: a PCIe (BAR1) mapping the platform granted. The platform default
+ * mapping is the window a virtual-address registration reaches anyway, since libfabric
+ * exports that mapping itself for a virtual address. A mapping type forced by configuration
+ * is honored whenever the export carries it.
+ * @param auto_mode Whether the mapping type comes from Auto rather than from configuration.
+ * @param want_pcie_mapping Whether the registration asked for the PCIe (BAR1) mapping.
+ * @param entry The export made for the registration; fd -1 when none was made.
+ * @return True to register with FI_MR_DMABUF, false to register by virtual address.
+ */
+inline bool
+cudaDmabufServesRegistration(bool auto_mode,
+                             bool want_pcie_mapping,
+                             const CudaDmabufExport &entry) {
+    if (entry.fd < 0 || entry.pcie_mapping != want_pcie_mapping) {
+        return false;
+    }
+    return !auto_mode || want_pcie_mapping;
+}
+
+/**
  * @brief Queries whether a CUDA device supports a dmabuf export that can be registered.
  * @note Requires both device dmabuf support and the RDMA dmabuf import ioctls the kernel
  * provides from 5.12 onwards.

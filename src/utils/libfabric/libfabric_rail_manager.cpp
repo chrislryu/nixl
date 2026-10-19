@@ -925,19 +925,20 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
                 break;
             }
 
+            // In Auto the default mapping is the window a virtual-address registration reaches
+            // anyway, so only a PCIe export can serve the registration; skip making the other
+            const bool auto_mode = dmabuf_mapping_mode_ == DmabufMappingMode::Auto;
             const size_t slot = want_pcie_mapping ? 1 : 0;
-            if (!dmabuf_exports.attempted[slot]) {
+            if (!dmabuf_exports.attempted[slot] && (!auto_mode || want_pcie_mapping)) {
                 dmabuf_exports.attempted[slot] = true;
                 LibfabricUtils::cudaDmabufExportRange(
                     buffer, length, device_id, want_pcie_mapping, dmabuf_exports.entries[slot]);
             }
-            // A PCIe mapping the platform refused leaves the export carrying the one window
-            // that platform offers, which is the window a virtual-address registration
-            // reaches anyway. Registering by virtual address instead keeps the GDRCopy
-            // mapping the EFA RDM provider skips for an FI_MR_DMABUF registration, so the
-            // dmabuf serves only the registrations whose mapping type it changes.
-            if (dmabuf_exports.entries[slot].fd >= 0 &&
-                want_pcie_mapping == dmabuf_exports.entries[slot].pcie_mapping) {
+            // A dmabuf serves only the registrations whose mapping type it changes;
+            // registering the rest by virtual address keeps the GDRCopy mapping the EFA RDM
+            // provider skips for an FI_MR_DMABUF registration
+            if (LibfabricUtils::cudaDmabufServesRegistration(
+                    auto_mode, want_pcie_mapping, dmabuf_exports.entries[slot])) {
                 dmabuf = &dmabuf_exports.entries[slot];
             }
         }

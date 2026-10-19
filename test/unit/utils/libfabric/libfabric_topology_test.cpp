@@ -356,6 +356,16 @@ static const DmabufMappingInfo dmabuf_mapping_topologies[] = {
      .expect_pcie_mapping = false,
      .default_mapping_exceptions = {}},
 
+    // g6 has no GPU P2P: its one EFA NIC shares no PCIe switch with any L4, so Auto names the
+    // platform default mapping and registers by virtual address.
+    {.enable = true,
+     .instance_type = "g6.48xl",
+     .topo_file = "g6.48xl-topo.xml",
+     .nic_count = 1,
+     .nic_line_speed = 100,
+     .expect_pcie_mapping = false,
+     .default_mapping_exceptions = {}},
+
     // Neuron instances. Grouping collects NVIDIA and AMD accelerators and runs on a host
     // carrying one, so every device on a Neuron-only host answers false, and
     // expect_grouping_skipped asserts that precondition. Each EFA device on these captures
