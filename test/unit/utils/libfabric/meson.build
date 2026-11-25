@@ -130,6 +130,18 @@ if get_option('buildtype') != 'release'
 
     test('spin_lock_test', spin_lock_test_bin)
 
+    # The request pool's allocate and release sides, under an allocating and a releasing
+    # thread. A data pool calls no libfabric function, so nothing is wrapped.
+    request_pool_test_bin = executable('request_pool_test',
+               'request_pool_test.cpp',
+               dependencies: libfabric_unit_test_deps,
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               install: true)
+
+    test('request_pool_test', request_pool_test_bin)
+
     # Alignment arithmetic of the CUDA dmabuf export. The helper under test is
     # header-inline and free of CUDA types, so the test runs on any host.
     libfabric_dmabuf_test_bin = executable('libfabric_dmabuf_test',

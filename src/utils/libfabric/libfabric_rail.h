@@ -29,7 +29,6 @@
 #include <atomic>
 #include <thread>
 #include <ostream>
-#include <stack>
 #include <cstddef>
 
 #include "nixl.h"
@@ -121,7 +120,32 @@ static_assert(offsetof(nixlLibfabricReq, ctx) == 0,
               "back to the request");
 #pragma GCC diagnostic pop
 
-/** Thread-safe request pool with O(1) allocation/release */
+/**
+ * @brief Thread-safe request pool with O(1) allocation/release
+ *
+ * With the progress thread on, the posting thread allocates every data request and the progress
+ * thread releases it, so the pool has two sides that each take their own lock:
+ *  - Allocate side: free_indices_, guarded by pool_mutex_. allocateReq() pops from it.
+ *  - Release side: released_indices_, guarded by release_mutex_. release() pushes to it.
+ * When free_indices_ runs dry, allocateReq() swaps the two lists under release_mutex_, an O(1)
+ * exchange of the vectors' buffers that takes every index released since the last swap. It
+ * expands the pool only when both lists are empty, that is when every request is in use. Both
+ * lists are reserved for every request of the pool, so a push or pop never allocates under a
+ * lock. Only an expansion allocates, and it reserves both lists again.
+ *
+ * Lock order: pool_mutex_, then release_mutex_. allocateReq() (for the swap and an expansion) and
+ * the getters take both, in that order. release() takes release_mutex_ alone and never calls
+ * back into the allocate side.
+ *
+ * A request's in_use flag and fields are written by allocateReq() under pool_mutex_ and by
+ * release() under release_mutex_, so neither lock alone orders the two writers. The request's
+ * path does: it reaches the thread that releases it only after its allocation (through the post
+ * ring's release and acquire, the endpoint lock, or on the allocating thread itself), and its
+ * index returns to allocateReq() only through the swap, after the release that pushed it has
+ * dropped release_mutex_. Each allocation therefore happens before the release of the request,
+ * and each release before its next allocation. Two releases of one request are ordered by
+ * release_mutex_, and the second finds in_use false and is ignored.
+ */
 class RequestPool {
 public:
     /** Initialize request pool with specified size */
@@ -142,11 +166,12 @@ public:
     size_t
     getPoolUtilization() const;
 
-    /** Waits on the pool's lock so far (see nixlLibfabricSpinLock::waitStats()) */
+    /** Waits on the pool's locks so far (see nixlLibfabricSpinLock::waitStats()) */
     nixlLibfabricSpinLock::WaitStats
     lockWaitStats() const;
 
-    /** Expand pool by doubling its size - virtual method for subclass implementation */
+    /** Expand pool by doubling its size - virtual method for subclass implementation. Called by
+     *  allocateReq() with pool_mutex_ held. */
     virtual nixl_status_t
     expandPool() = 0;
 
@@ -165,22 +190,34 @@ public:
     operator=(RequestPool &&) = delete;
 
 protected:
-    /** Initialize base pool structure with specified size */
+    /** Add pool_size requests to the pool. Called by the constructor, and by expandPool() with
+     *  pool_mutex_ held; takes release_mutex_. */
     void
     initializeBasePool(size_t pool_size);
 
+    // Grows only in expandPool(), under pool_mutex_, and is indexed only under pool_mutex_ or
+    // before the pool is shared. std::deque keeps references to its elements valid when it
+    // grows, so release() and the completion path use their request pointers without
+    // pool_mutex_ and never touch the deque itself.
     mutable std::deque<nixlLibfabricReq> requests_; ///< Expandable request pool
-    mutable std::stack<size_t> free_indices_; ///< Stack of available request indices
     size_t rail_id_; ///< Rail ID for this pool
     size_t initial_pool_size_; ///< Original pool size for expansion calculations
 
-    // Guards requests_, free_indices_ and every change of a request's in_use flag. With the
-    // progress thread on, the posting thread allocates data requests and the progress thread
-    // releases them, so the lock passes between the two on every operation. A holder only moves
-    // an index and resets a few fields, so this is a spin lock: its waiters spin before they
-    // sleep, where a mutex's waiters sleep in the kernel at once. expandPool() also runs under it
-    // (see allocateReq()). Nothing under it calls back into a pool.
-    mutable nixlLibfabricSpinLock pool_mutex_;
+    // requests_.size(), for release()'s bounds check: release() does not hold pool_mutex_, under
+    // which an expansion changes requests_.size(). Written only by initializeBasePool().
+    std::atomic<size_t> capacity_{0};
+
+    // Allocate side, on its own cache line so that the release side does not share it. Both locks
+    // are spin locks: a holder only moves an index or swaps two vectors and resets a few fields,
+    // so their waiters spin before they sleep, where a mutex's waiters sleep in the kernel at
+    // once. expandPool() also runs under pool_mutex_ (see allocateReq()). Nothing under either
+    // lock calls back into a pool.
+    alignas(64) mutable nixlLibfabricSpinLock pool_mutex_;
+    std::vector<size_t> free_indices_; ///< Available request indices (pool_mutex_)
+
+    // Release side
+    alignas(64) mutable nixlLibfabricSpinLock release_mutex_;
+    mutable std::vector<size_t> released_indices_; ///< Indices released since the last swap
 };
 
 /** Buffer chunk structure for control request pool */

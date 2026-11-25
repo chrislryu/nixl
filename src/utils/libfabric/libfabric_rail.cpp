@@ -28,7 +28,6 @@
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
-#include <stack>
 
 /*
  * The value of the following libfabric EFA provider option is hard-coded on purpose.
@@ -72,13 +71,30 @@ RequestPool::RequestPool(size_t pool_size, size_t rail_id)
 void
 RequestPool::initializeBasePool(size_t pool_size) {
     size_t current_size = requests_.size();
-    requests_.resize(current_size + pool_size);
+    const size_t new_size = current_size + pool_size;
+    requests_.resize(new_size);
+    capacity_.store(new_size, std::memory_order_relaxed);
+
+    // Reserve both index lists for every request of the pool, so that allocateReq() and release()
+    // never allocate under their locks. An index is in at most one of the lists, and only while
+    // its request is free, so neither list can outgrow that. release() does not wait for the
+    // release side's allocation: the new buffer is reserved first, and only the copy of the
+    // indices released so far, which fits in it, and the swap run under release_mutex_. The old
+    // buffer is freed after the unlock, when released goes out of scope.
+    free_indices_.reserve(new_size);
+    std::vector<size_t> released;
+    released.reserve(new_size);
+    {
+        std::lock_guard<nixlLibfabricSpinLock> release_lock(release_mutex_);
+        released.assign(released_indices_.begin(), released_indices_.end());
+        released_indices_.swap(released);
+    }
 
     for (size_t i = current_size; i < requests_.size(); ++i) {
         requests_[i].rail_id = rail_id_;
         requests_[i].pool_index = i; // Set the pool index for deque compatibility
         requests_[i].in_use = false;
-        free_indices_.push(i);
+        free_indices_.push_back(i);
     }
 
     NIXL_DEBUG << "InitializeBasePool - Rail " << rail_id_
@@ -97,9 +113,11 @@ RequestPool::release(nixlLibfabricReq *req) const {
     // request's callback may own captured state, and freeing that does not belong under a spin
     // lock.
     std::function<void(nixl_status_t)> callback;
-    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
+    // The release side only: the allocating thread keeps allocating meanwhile (see RequestPool)
+    std::lock_guard<nixlLibfabricSpinLock> lock(release_mutex_);
 
-    // GUARD: Check if already released
+    // GUARD: Check if already released. The allocation that set in_use happens before this
+    // release, and an earlier release of the request holds the same lock (see RequestPool).
     if (!req->in_use) {
         NIXL_WARN << "Attempt to double-release request XFER_ID=" << req->xfer_id << " on rail "
                   << rail_id_ << " - ignoring to prevent corruption";
@@ -120,31 +138,41 @@ RequestPool::release(nixlLibfabricReq *req) const {
     // Use pool_index instead of pointer arithmetic for deque compatibility
     size_t idx = req->pool_index;
 
-    // Validate the index is within bounds
-    if (idx >= requests_.size()) {
+    // Validate the index is within bounds. A relaxed load is enough: the expansion that added
+    // this request stored a capacity above its index before the request was allocated, and so
+    // before this release.
+    const size_t capacity = capacity_.load(std::memory_order_relaxed);
+    if (idx >= capacity) {
         NIXL_ERROR << "Release Req on Rail " << rail_id_ << " invalid pool index " << idx
-                   << " for request release (pool size=" << requests_.size() << ")";
+                   << " for request release (pool size=" << capacity << ")";
         return;
     }
 
-    free_indices_.push(idx);
+    released_indices_.push_back(idx); // never reallocates: reserved for the whole pool
 }
 
 size_t
 RequestPool::getActiveRequestCount() const {
+    // Both sides, in lock order, so that no allocation or release is half done and the count is
+    // exact
     std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
-    return requests_.size() - free_indices_.size();
+    std::lock_guard<nixlLibfabricSpinLock> release_lock(release_mutex_);
+    return requests_.size() - free_indices_.size() - released_indices_.size();
 }
 
 nixlLibfabricSpinLock::WaitStats
 RequestPool::lockWaitStats() const {
-    return pool_mutex_.waitStats();
+    nixlLibfabricSpinLock::WaitStats stats = pool_mutex_.waitStats();
+    stats += release_mutex_.waitStats();
+    return stats;
 }
 
 size_t
 RequestPool::getPoolUtilization() const {
     std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
-    return ((requests_.size() - free_indices_.size()) * 100) / requests_.size();
+    std::lock_guard<nixlLibfabricSpinLock> release_lock(release_mutex_);
+    return ((requests_.size() - free_indices_.size() - released_indices_.size()) * 100) /
+        requests_.size();
 }
 
 nixlLibfabricReq *
@@ -152,10 +180,20 @@ RequestPool::allocateReq(uint32_t req_id) {
     std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
 
     if (free_indices_.empty()) {
-        // Expanding under the spin lock is rare: the pool never shrinks, so it grows only when
-        // the number of requests in flight passes its size. A control pool expansion registers
-        // a new buffer chunk (fi_mr_reg) and holds the lock for that long. Waiters spin and
-        // yield only briefly, then sleep until it ends, as they did on a mutex.
+        // Take every index released since the last swap. The swap exchanges the two vectors'
+        // buffers, so it neither copies nor allocates, and the release side gets back the empty
+        // buffer, which is reserved for the whole pool as well.
+        std::lock_guard<nixlLibfabricSpinLock> release_lock(release_mutex_);
+        free_indices_.swap(released_indices_);
+    }
+
+    if (free_indices_.empty()) {
+        // Every request is in use. Expanding under the spin lock is rare: the pool never
+        // shrinks, so it grows only when the number of requests in flight passes its size. A
+        // control pool expansion registers a new buffer chunk (fi_mr_reg) and holds the lock for
+        // that long. Waiters spin and yield only briefly, then sleep until it ends, as they did
+        // on a mutex. release() does not wait for it: it takes only release_mutex_, which the
+        // expansion holds just to reserve the release side again.
         size_t old_size = requests_.size();
 
         // Try to expand the pool using the derived class implementation
@@ -177,8 +215,8 @@ RequestPool::allocateReq(uint32_t req_id) {
                    << old_size << " to " << requests_.size() << " requests";
     }
 
-    size_t idx = free_indices_.top();
-    free_indices_.pop();
+    size_t idx = free_indices_.back();
+    free_indices_.pop_back();
 
     nixlLibfabricReq *req = &requests_[idx];
     req->in_use = true;
