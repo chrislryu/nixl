@@ -109,6 +109,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
     req->chunk_offset = 0;
     req->chunk_size = 0;
     req->completion_callback = nullptr;
+    req->completion_sink = nullptr;
     memset(&req->ctx, 0, sizeof(fi_context));
 
     // Use pool_index instead of pointer arithmetic for deque compatibility
@@ -870,6 +871,73 @@ nixlLibfabricRail::setXferErrorCallback(
     xferErrorCallback = callback;
 }
 
+// Counts the successful data completions of one CQ read per run of the same sink, and reports
+// each run with one complete_requests() call: when a completion of another sink arrives, and on
+// flush(). The requests of a run are released before it is reported. The batch refers to a sink
+// only while that sink has a count pending, and a pending count keeps its transfer incomplete,
+// so the owner cannot destroy the sink before the flush. The flush clears the batch before it
+// reports, so nothing refers to the sink once the report completes its transfer.
+class nixlLibfabricRail::CompletionBatch {
+public:
+    CompletionBatch() = default;
+    CompletionBatch(const CompletionBatch &) = delete;
+    CompletionBatch &
+    operator=(const CompletionBatch &) = delete;
+
+    // A count still pending here is reported, so no return path loses it
+    ~CompletionBatch() {
+        flush();
+    }
+
+    // Count one successful completion for sink, whose request is already released
+    void
+    add(nixlLibfabricCompletionSink *sink) {
+        if (sink == nullptr) {
+            return;
+        }
+        if (sink != sink_) {
+            flush();
+            sink_ = sink;
+        }
+        ++count_;
+    }
+
+    void
+    flush() {
+        if (count_ == 0) {
+            return;
+        }
+        nixlLibfabricCompletionSink *sink = sink_;
+        const size_t count = count_;
+        sink_ = nullptr;
+        count_ = 0;
+        sink->complete_requests(count, NIXL_SUCCESS);
+    }
+
+private:
+    nixlLibfabricCompletionSink *sink_ = nullptr; // non-null exactly when count_ > 0
+    size_t count_ = 0;
+};
+
+void
+nixlLibfabricRail::failRequest(nixlLibfabricReq *req, nixl_status_t status) const {
+    nixlLibfabricCompletionSink *sink = req->completion_sink;
+    if (sink == nullptr) {
+        // Control request: run its callback, then release it, as for a successful send
+        if (req->completion_callback) {
+            req->completion_callback(status);
+        }
+        releaseRequest(req);
+        return;
+    }
+    // Data request: release it first and do not touch it again, since it can be reallocated
+    // at once. The sink stores the error before it counts the request, so the error is visible
+    // once the transfer reads as complete. That count may complete the transfer, after which
+    // the owner may destroy the sink, so nothing here touches the sink after the call.
+    releaseRequest(req);
+    sink->complete_requests(1, status);
+}
+
 // Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
 nixl_status_t
 nixlLibfabricRail::progressCompletionQueue() {
@@ -905,14 +973,12 @@ nixlLibfabricRail::progressCompletionQueue() {
                        << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
 
             // Notify the owning handle of the error and release the request. Done without the
-            // EP lock: the callback and the request pool take their own locks.
+            // EP lock: the handle and the request pool take their own locks. A read that fails
+            // returns no entries, so this call has no data completion pending to report first.
             if (err_entry.op_context) {
                 nixlLibfabricReq *req = findRequestFromContext(err_entry.op_context);
                 if (req && req->in_use) {
-                    if (req->completion_callback) {
-                        req->completion_callback(NIXL_ERR_BACKEND);
-                    }
-                    releaseRequest(req);
+                    failRequest(req, NIXL_ERR_BACKEND);
                 }
             }
         } else {
@@ -926,10 +992,12 @@ nixlLibfabricRail::progressCompletionQueue() {
     }
 
     if (ret > 0) {
+        CompletionBatch batch;
         nixl_status_t first_error = NIXL_SUCCESS;
         for (int i = 0; i < ret; ++i) {
             // Process completion using local data. Callbacks have their own thread safety
-            nixl_status_t status = processCompletionQueueEntry(&completions[i], src_addrs[i]);
+            nixl_status_t status =
+                processCompletionQueueEntry(&completions[i], src_addrs[i], batch);
             if (status != NIXL_SUCCESS) {
                 NIXL_ERROR << "Failed to process completion " << i << " out of batch of " << ret
                            << " on rail " << rail_id << " with status " << status;
@@ -940,6 +1008,8 @@ nixlLibfabricRail::progressCompletionQueue() {
                 }
             }
         }
+        // Report this read's data completions before draining the post queue
+        batch.flush();
 
         if (first_error != NIXL_SUCCESS) {
             return first_error;
@@ -974,9 +1044,11 @@ nixlLibfabricRail::pollForCompletions() {
         }
     }
     if (cq_ret > 0) {
+        CompletionBatch batch;
         for (int c = 0; c < cq_ret; c++) {
-            processCompletionQueueEntry(&cq_buf[c], src_addrs[c]);
+            processCompletionQueueEntry(&cq_buf[c], src_addrs[c], batch);
         }
+        batch.flush();
     } else if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
         NIXL_ERROR << "CQ error in drain interleave on rail " << rail_id << ": "
                    << fi_strerror(err_entry.err);
@@ -986,7 +1058,8 @@ nixlLibfabricRail::pollForCompletions() {
 // Route completion to appropriate handler (rail-specific)
 nixl_status_t
 nixlLibfabricRail::processCompletionQueueEntry(struct fi_cq_data_entry *comp,
-                                               fi_addr_t src_addr) const {
+                                               fi_addr_t src_addr,
+                                               CompletionBatch &batch) const {
     uint64_t flags = comp->flags;
 
     NIXL_TRACE << "Routing completion from rail " << rail_id << " with flags=" << std::hex << flags
@@ -1004,11 +1077,11 @@ nixlLibfabricRail::processCompletionQueueEntry(struct fi_cq_data_entry *comp,
 
     } else if (flags & FI_WRITE) {
         // Local write completions (fi_writemsg with remote completion) - use context
-        return processLocalTransferCompletion(comp, "write");
+        return processLocalTransferCompletion(comp, "write", batch);
 
     } else if (flags & FI_READ) {
         // Local read completions (fi_readdata) - use context
-        return processLocalTransferCompletion(comp, "read");
+        return processLocalTransferCompletion(comp, "read", batch);
 
     } else if (flags & FI_REMOTE_WRITE || flags & FI_REMOTE_CQ_DATA) {
         // Remote write completions (from fi_writemsg with remote completion) - use immediate data
@@ -1081,18 +1154,17 @@ nixlLibfabricRail::processLocalSendCompletion(struct fi_cq_data_entry *comp) con
 // Handle local transfer completions (both read and write operations from postXfer)
 nixl_status_t
 nixlLibfabricRail::processLocalTransferCompletion(struct fi_cq_data_entry *comp,
-                                                  const char *operation_type) const {
-    // Find the request from context to access the completion callback
+                                                  const char *operation_type,
+                                                  CompletionBatch &batch) const {
+    // Find the request from context to access its completion sink
     nixlLibfabricReq *req = findRequestFromContext(comp->op_context);
     if (req && req->in_use) { // Only process if request is still valid and in use
-        // Call completion callback if it exists
-        if (req->completion_callback) {
-            NIXL_TRACE << "Calling completion callback for " << operation_type << " request "
-                       << req->xfer_id;
-            req->completion_callback(NIXL_SUCCESS);
-            NIXL_TRACE << "Completion callback completed for " << operation_type;
-        }
+        // Take the sink, then release the request: it can be reallocated as soon as it is back
+        // in the pool, so it is not read again. The batch reports the completion later.
+        nixlLibfabricCompletionSink *sink = req->completion_sink;
+        NIXL_TRACE << "Completed " << operation_type << " request " << req->xfer_id;
         releaseRequest(req);
+        batch.add(sink);
     } else if (req && !req->in_use) {
         NIXL_WARN << "Completion received for already released " << operation_type << " request "
                   << req->xfer_id << " on rail " << rail_id << " - skipping to prevent double-free";
@@ -1407,11 +1479,8 @@ nixlLibfabricRail::drainPostQueue() {
             if (cuda_ctx_status != NIXL_SUCCESS) {
                 // completion is notified also for failed requests
                 // (otherwise counters would never match)
-                if (pr.req && pr.req->completion_callback) {
-                    pr.req->completion_callback(cuda_ctx_status);
-                }
                 if (pr.req) {
-                    releaseRequest(pr.req);
+                    failRequest(pr.req, cuda_ctx_status);
                 }
 
                 // defrred request cannot be executed, continue to the next
@@ -1425,11 +1494,8 @@ nixlLibfabricRail::drainPostQueue() {
                 if (cuda_ret != cudaSuccess) {
                     // completion is notified also for failed requests
                     // (otherwise counters would never match)
-                    if (pr.req && pr.req->completion_callback) {
-                        pr.req->completion_callback(NIXL_ERR_BACKEND);
-                    }
                     if (pr.req) {
-                        releaseRequest(pr.req);
+                        failRequest(pr.req, NIXL_ERR_BACKEND);
                     }
 
                     // defrred request cannot be executed, continue to the next
@@ -1499,13 +1565,10 @@ nixlLibfabricRail::drainPostQueue() {
         if (ret != 0) {
             NIXL_ERROR << "drainPostQueue: post failed ret=" << ret << " (" << fi_strerror(-ret)
                        << ") on rail " << rail_id;
-            if (pr.req && pr.req->completion_callback) {
+            if (pr.req) {
                 // completion is notified also for failed requests
                 // (otherwise counters would never match)
-                pr.req->completion_callback(NIXL_ERR_BACKEND);
-            }
-            if (pr.req) {
-                releaseRequest(pr.req);
+                failRequest(pr.req, NIXL_ERR_BACKEND);
             }
             continue;
         }

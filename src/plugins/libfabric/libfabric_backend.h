@@ -119,8 +119,8 @@ public:
     friend class nixlLibfabricEngine;
 };
 
-/** Request handle for multi-rail transfer operations */
-class nixlLibfabricBackendH : public nixlBackendReqH {
+/** Request handle for multi-rail transfer operations, and the completion sink of its requests */
+class nixlLibfabricBackendH : public nixlBackendReqH, public nixlLibfabricCompletionSink {
 private:
     std::atomic<size_t> completed_requests_; // Atomic count of completed requests
     std::atomic<size_t> submitted_requests_; // Total number of submitted requests
@@ -148,12 +148,13 @@ public:
     void
     init_request_tracking(size_t num_requests);
 
-    /** Record completion of one request (with status).
+    /** Record completion of count requests, all with the same status.
      *  Stores error and bumps successful_requests_ before incrementing the counter so that
      *  is_completed() observers always see the error_status_ that caused the transition and the
-     *  final successful count. */
+     *  final successful count. The increment can complete the transfer, after which the owner
+     *  may release the handle, so the call does not touch the handle after it. */
     void
-    complete_request(nixl_status_t status);
+    complete_requests(size_t count, nixl_status_t status) override;
 
     /** Get current count of requests completed as part of this transfer */
     size_t

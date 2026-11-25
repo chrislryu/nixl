@@ -431,7 +431,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     const std::vector<size_t> &remote_selected_endpoints,
     const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
     uint16_t xfer_id,
-    std::function<void(nixl_status_t)> completion_callback,
+    nixlLibfabricCompletionSink *completion_sink,
     size_t &submitted_count_out,
     int desc_idx,
     size_t base_offset,
@@ -470,8 +470,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
             NIXL_ERROR << "Failed to allocate request for rail " << rail_id;
             return NIXL_ERR_BACKEND;
         }
-        // Set completion callback and populate request
-        req->completion_callback = completion_callback;
+        // Set completion sink and populate request
+        req->completion_sink = completion_sink;
         req->chunk_offset = 0;
         req->chunk_size = transfer_size;
         req->local_addr = local_addr;
@@ -563,7 +563,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                 return NIXL_ERR_BACKEND;
             }
 
-            req->completion_callback = completion_callback;
+            req->completion_sink = completion_sink;
 
             // Calculate and populate chunk info
             size_t chunk_offset = i * chunk_size;

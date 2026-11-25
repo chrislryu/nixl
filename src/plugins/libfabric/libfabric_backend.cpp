@@ -421,20 +421,21 @@ nixlLibfabricBackendH::init_request_tracking(size_t num_requests) {
 }
 
 void
-nixlLibfabricBackendH::complete_request(nixl_status_t status) {
+nixlLibfabricBackendH::complete_requests(size_t count, nixl_status_t status) {
     if (status != NIXL_SUCCESS) {
         nixl_status_t expected = NIXL_SUCCESS;
         error_status_.compare_exchange_strong(
             expected, status, std::memory_order_relaxed, std::memory_order_relaxed);
     } else {
-        successful_requests_.fetch_add(1, std::memory_order_relaxed);
+        successful_requests_.fetch_add(count, std::memory_order_relaxed);
     }
-    // Release ensures the error store above is visible to any thread that
+    // Release ensures the stores above are visible to any thread that
     // observes the incremented count via an acquire load in is_completed().
-    completed_requests_.fetch_add(1, std::memory_order_release);
-    NIXL_DEBUG << "Request completed (status=" << status
-               << "), total completed: " << completed_requests_.load(std::memory_order_relaxed)
-               << "/" << submitted_requests_.load(std::memory_order_relaxed);
+    // Once that count completes the transfer the handle may be freed: log locals only.
+    const size_t completed =
+        completed_requests_.fetch_add(count, std::memory_order_release) + count;
+    NIXL_DEBUG << count << " request(s) completed (status=" << status
+               << "), total completed: " << completed;
 }
 
 size_t
@@ -470,7 +471,7 @@ nixlLibfabricBackendH::claim_xfer_error_send() {
 
 bool
 nixlLibfabricBackendH::is_completed() const {
-    // Acquire pairs with release in complete_request() — guarantees we see
+    // Acquire pairs with release in complete_requests() — guarantees we see
     // any error_status_ written before the final increment.
     return completed_requests_.load(std::memory_order_acquire) ==
         submitted_requests_.load(std::memory_order_relaxed);
@@ -1417,27 +1418,25 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
         uint64_t remote_registered_base = remote_md->remote_buf_addr_;
 
         size_t desc_submitted_count = 0;
-        nixl_status_t status = rail_manager_.prepareAndSubmitTransfer(
-            op_type,
-            transfer_addr,
-            transfer_size,
-            remote_target_addr,
-            remote_registered_base,
-            local_md->selected_rails_,
-            local_md->rail_mr_list_,
-            remote_md->rail_remote_key_list_,
-            remote_md->remote_selected_endpoints_,
-            conn->rail_remote_addr_list_,
-            backend_handle->post_xfer_id,
-            [backend_handle](nixl_status_t status) {
-                backend_handle->complete_request(status);
-            }, // Completion callback
-            desc_submitted_count,
-            desc_idx,
-            xfer_base_offset,
-            apply_fi_more,
-            local[desc_idx].devId,
-            is_cuda_vram);
+        nixl_status_t status =
+            rail_manager_.prepareAndSubmitTransfer(op_type,
+                                                   transfer_addr,
+                                                   transfer_size,
+                                                   remote_target_addr,
+                                                   remote_registered_base,
+                                                   local_md->selected_rails_,
+                                                   local_md->rail_mr_list_,
+                                                   remote_md->rail_remote_key_list_,
+                                                   remote_md->remote_selected_endpoints_,
+                                                   conn->rail_remote_addr_list_,
+                                                   backend_handle->post_xfer_id,
+                                                   backend_handle, // Completion sink
+                                                   desc_submitted_count,
+                                                   desc_idx,
+                                                   xfer_base_offset,
+                                                   apply_fi_more,
+                                                   local[desc_idx].devId,
+                                                   is_cuda_vram);
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx

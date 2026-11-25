@@ -102,6 +102,23 @@ if get_option('buildtype') != 'release'
 
     test('striping_threshold_test', striping_threshold_test_bin)
 
+    completion_batch_test_link_args = [
+        '-Wl,--wrap=fi_getinfo',
+        '-Wl,--wrap=numa_max_node',
+        '-Wl,--wrap=numa_num_configured_nodes',
+        '-Wl,--wrap=fi_fabric' ]
+
+    completion_batch_test_bin = executable('completion_batch_test',
+               'completion_batch_test.cpp',
+               dependencies: libfabric_unit_test_deps,
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               link_args: completion_batch_test_link_args,
+               install: true)
+
+    test('completion_batch_test', completion_batch_test_bin)
+
     # Alignment arithmetic of the CUDA dmabuf export. The helper under test is
     # header-inline and free of CUDA types, so the test runs on any host.
     libfabric_dmabuf_test_bin = executable('libfabric_dmabuf_test',

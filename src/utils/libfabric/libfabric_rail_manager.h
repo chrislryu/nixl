@@ -215,7 +215,7 @@ public:
      * @param remote_selected_endpoints Selected remote endpoints, where remote keys are registered
      * @param dest_addrs Destination addresses for each rail
      * @param xfer_id Transfer ID for tracking
-     * @param completion_callback Callback for completion notification
+     * @param completion_sink Sink that each submitted request reports its completion to
      * @param submitted_count_out Number of requests successfully submitted
      * @param desc_idx Index of current descriptor within the transfer
      * @param base_offset Pre-reserved round-robin offset from reserveBaseOffset()
@@ -239,7 +239,7 @@ public:
                              const std::vector<size_t> &remote_selected_endpoints,
                              const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
                              uint16_t xfer_id,
-                             std::function<void(nixl_status_t)> completion_callback,
+                             nixlLibfabricCompletionSink *completion_sink,
                              size_t &submitted_count_out,
                              int desc_idx,
                              size_t base_offset,

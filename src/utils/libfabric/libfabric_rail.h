@@ -41,11 +41,33 @@
 class nixlLibfabricConnection;
 
 /**
+ * @brief Owner of the data requests (WRITE, READ) of one transfer, told when they complete.
+ *
+ * Each data request points to the sink of its transfer. The rail counts the successful
+ * completions of one CQ read per run of requests with the same sink and reports each run with
+ * one complete_requests() call. A request that fails is reported on its own, with its error.
+ * A request is released before its completion is reported, and the rail does not touch the
+ * sink after the call: once the call completes the transfer, the owner may destroy the sink.
+ */
+class nixlLibfabricCompletionSink {
+public:
+    /** Count count requests of this sink as completed with status. */
+    virtual void
+    complete_requests(size_t count, nixl_status_t status) = 0;
+
+protected:
+    ~nixlLibfabricCompletionSink() = default;
+};
+
+/**
  * @brief Request structure for libfabric operations
  *
  * Every operation passes &ctx as its libfabric context, and a completion maps op_context back to
  * the request with a plain cast (nixlLibfabricRail::findRequestFromContext()). ctx must therefore
  * stay the first member; the static_assert after the struct enforces it.
+ *
+ * A control request (SEND, RECV) reports its completion through completion_callback, a data
+ * request (WRITE, READ) through completion_sink.
  */
 struct nixlLibfabricReq {
     fi_context ctx; ///< Libfabric context for operation tracking; must stay the first member
@@ -61,7 +83,8 @@ struct nixlLibfabricReq {
     bool in_use; ///< Pool management flag
     size_t chunk_offset; ///< Chunk offset for DATA requests
     size_t chunk_size; ///< Chunk size for DATA requests
-    std::function<void(nixl_status_t)> completion_callback; ///< Completion callback function
+    std::function<void(nixl_status_t)> completion_callback; ///< Completion callback (control)
+    nixlLibfabricCompletionSink *completion_sink; ///< Completion sink (data), or nullptr
     void *local_addr; ///< Local memory address for transfers
     uint64_t remote_addr; ///< Remote memory address for transfers
     struct fid_mr *local_mr; ///< Local memory registration for transfers
@@ -79,6 +102,7 @@ struct nixlLibfabricReq {
           in_use(false),
           chunk_offset(0),
           chunk_size(0),
+          completion_sink(nullptr),
           local_addr(nullptr),
           remote_addr(0),
           local_mr(nullptr),
@@ -638,6 +662,12 @@ public:
     void
     releaseRequest(nixlLibfabricReq *req) const;
 
+    /** Number of data requests allocated and not yet released */
+    size_t
+    getActiveDataRequestCount() const {
+        return data_request_pool_.getActiveRequestCount();
+    }
+
     /** Find request from libfabric context pointer */
     nixlLibfabricReq *
     findRequestFromContext(void *context) const;
@@ -715,13 +745,26 @@ private:
     void
     mapSourceAddress(fi_addr_t fi_addr, uint32_t agent_idx) const;
 
+    /** Successful data completions of one CQ read, counted per run of the same sink. */
+    class CompletionBatch;
+
+    /** Release a request that will not complete and report it to its owner with status: a
+     *  data request as one completion of its sink, a control request through its callback. */
+    void
+    failRequest(nixlLibfabricReq *req, nixl_status_t status) const;
+
     // src_addr is FI_ADDR_NOTAVAIL when the provider has none (always for local completions).
+    // Successful data completions are counted in batch, which the caller flushes.
     nixl_status_t
-    processCompletionQueueEntry(struct fi_cq_data_entry *comp, fi_addr_t src_addr) const;
+    processCompletionQueueEntry(struct fi_cq_data_entry *comp,
+                                fi_addr_t src_addr,
+                                CompletionBatch &batch) const;
     nixl_status_t
     processLocalSendCompletion(struct fi_cq_data_entry *comp) const;
     nixl_status_t
-    processLocalTransferCompletion(struct fi_cq_data_entry *comp, const char *operation_type) const;
+    processLocalTransferCompletion(struct fi_cq_data_entry *comp,
+                                   const char *operation_type,
+                                   CompletionBatch &batch) const;
     nixl_status_t
     processRecvCompletion(struct fi_cq_data_entry *comp, fi_addr_t src_addr) const;
     nixl_status_t
