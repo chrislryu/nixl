@@ -688,7 +688,8 @@ testLongRun(nixlLibfabricRailManager &mgr) {
 
 static int
 testSubmitFlags(nixlLibfabricRailManager &mgr) {
-    // prepareAndSubmitTransfer() sets FI_MORE on WRITEs only: a READ keeps the per-post lock
+    // prepareAndSubmitTransfer() sets FI_MORE on WRITEs and on READs below
+    // READ_FI_MORE_MAX_LENGTH; a larger READ is posted without it
     NIXL_INFO << "  submitted flags";
     watch("submitted flags", true);
     nixlLibfabricRail &rail = mgr.getRail(0);
@@ -709,12 +710,13 @@ testSubmitFlags(nixlLibfabricRailManager &mgr) {
     const std::vector<uint64_t> remote_keys(NUM_FAKE_RAILS, 7);
     const std::unordered_map<size_t, std::vector<fi_addr_t>> dest_addrs = {{0, {0}}};
     std::vector<char> buffer(SMALL);
-    auto submit = [&](nixlLibfabricReq::OpType op, bool apply_fi_more) {
+    std::vector<char> large(nixlLibfabricRailManager::READ_FI_MORE_MAX_LENGTH);
+    auto submit = [&](nixlLibfabricReq::OpType op, bool apply_fi_more, std::vector<char> &buf) {
         size_t submitted = 0;
         const nixl_status_t status =
             mgr.prepareAndSubmitTransfer(op,
-                                         buffer.data(),
-                                         SMALL,
+                                         buf.data(),
+                                         buf.size(),
                                          /*remote_target_addr=*/0x10000,
                                          /*remote_registered_base=*/0x10000,
                                          rails,
@@ -733,19 +735,23 @@ testSubmitFlags(nixlLibfabricRailManager &mgr) {
                                          /*stager=*/nullptr);
         return status == NIXL_SUCCESS && submitted == 1;
     };
-    TEST_ASSERT(submit(nixlLibfabricReq::WRITE, true), "WRITE with FI_MORE submitted");
-    TEST_ASSERT(submit(nixlLibfabricReq::READ, true), "READ asked for FI_MORE submitted");
-    TEST_ASSERT(submit(nixlLibfabricReq::WRITE, false), "WRITE without FI_MORE submitted");
-    drainUntil(rail, 3);
+    TEST_ASSERT(submit(nixlLibfabricReq::WRITE, true, buffer), "WRITE with FI_MORE submitted");
+    TEST_ASSERT(submit(nixlLibfabricReq::READ, true, buffer), "small READ with FI_MORE submitted");
+    TEST_ASSERT(submit(nixlLibfabricReq::READ, true, large),
+                "large READ asked for FI_MORE submitted");
+    TEST_ASSERT(submit(nixlLibfabricReq::WRITE, false, buffer), "WRITE without FI_MORE submitted");
+    drainUntil(rail, 4);
     const uintptr_t id = reinterpret_cast<uintptr_t>(buffer.data());
-    const std::string diff =
-        checkPosts(recorded(), {Post{id, true}, Post{id, false, false}, Post{id, false}});
+    const uintptr_t large_id = reinterpret_cast<uintptr_t>(large.data());
+    const std::string diff = checkPosts(
+        recorded(),
+        {Post{id, true}, Post{id, true, false}, Post{large_id, false, false}, Post{id, false}});
     TEST_ASSERT(diff.empty(), "submitted flags: " + diff);
 
     for (size_t i = 0; i < 100 && !sq.empty(); ++i) {
         rail.progressCompletionQueue();
     }
-    TEST_ASSERT(sink.completed == 3, "submitted posts completed");
+    TEST_ASSERT(sink.completed == 4, "submitted posts completed");
     TEST_ASSERT(rail.getActiveDataRequestCount() == 0, "submitted requests released");
     return 0;
 }

@@ -405,8 +405,8 @@ private:
                         bool allow_fi_more,
                         size_t &submitted_count) const;
 
-    /** Rail a WRITE descriptor posts on, or -1 if it does not participate in FI_MORE batching
-     *  (no metadata, no selected rails, or striped across multiple rails). */
+    /** Rail a WRITE or READ descriptor posts on, or -1 if it does not participate in FI_MORE
+     *  batching (no metadata, no selected rails, or striped across multiple rails). */
     int
     batchingRail(const nixl_meta_dlist_t &local, int desc_idx, size_t xfer_base_offset) const;
 

@@ -1332,7 +1332,7 @@ nixlLibfabricEngine::batchingRail(const nixl_meta_dlist_t &local,
         return -1;
     }
     return (int)md->selected_rails_[nixlLibfabricRailManager::railSelectionIndex(
-        xfer_base_offset, desc_idx, /*batch_write=*/true, md->selected_rails_.size())];
+        xfer_base_offset, desc_idx, /*batched=*/true, md->selected_rails_.size())];
 }
 
 bool
@@ -1388,11 +1388,12 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
     // last post flushed, or its batch would never be submitted.
     // allow_fi_more is false on the thread-pool path: chunks on other threads can interleave
     // posts on the same rail, so a per-chunk walk cannot know a rail's true last post there.
-    const bool batch_writes = allow_fi_more && op_type == nixlLibfabricReq::WRITE;
+    const bool batch_posts =
+        allow_fi_more && (op_type == nixlLibfabricReq::WRITE || op_type == nixlLibfabricReq::READ);
 
     std::vector<int> last_desc_idx_per_rail(rail_manager_.getNumRails(), -1);
     std::vector<int> posts_since_flush(rail_manager_.getNumRails(), 0);
-    if (batch_writes) {
+    if (batch_posts) {
         for (int i = start_idx; i < end_idx; ++i) {
             const int rail_id = batchingRail(local, i, xfer_base_offset);
             if (rail_id >= 0) {
@@ -1409,7 +1410,7 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
     nixlLibfabricPostStager stager(rail_manager_);
 
     for (int desc_idx = start_idx; desc_idx < end_idx; ++desc_idx) {
-        const int rail_id = batch_writes ? batchingRail(local, desc_idx, xfer_base_offset) : -1;
+        const int rail_id = batch_posts ? batchingRail(local, desc_idx, xfer_base_offset) : -1;
         const bool apply_fi_more =
             useFiMore(desc_idx, rail_id, last_desc_idx_per_rail, posts_since_flush);
 

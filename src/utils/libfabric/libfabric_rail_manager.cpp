@@ -441,19 +441,24 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     bool use_striping = usesStriping(transfer_size, selected_rails.size());
     NIXL_DEBUG << "use_striping=" << use_striping;
     if (!use_striping) {
-        // WRITE: group NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors on one rail
-        // for FI_MORE batching. READ: per-descriptor round-robin (FI_MORE has no benefit).
-        // apply_fi_more is precomputed by the caller, which leaves it false for the last post
-        // on each rail so that every rail's FI_MORE batch is flushed.
-        const bool batch_write = (op_type == nixlLibfabricReq::WRITE);
+        // WRITE and READ: group NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors on
+        // one rail for FI_MORE batching, so a group shares one doorbell. A READ of
+        // READ_FI_MORE_MAX_LENGTH or more is posted without FI_MORE; it rings its own doorbell,
+        // which also submits what its rail has queued. apply_fi_more is precomputed by the
+        // caller, which leaves it false for the last post on each rail so that every rail's
+        // FI_MORE batch is flushed.
+        const bool batched =
+            (op_type == nixlLibfabricReq::WRITE || op_type == nixlLibfabricReq::READ);
         const size_t rail_sel_idx =
-            railSelectionIndex(base_offset, desc_idx, batch_write, selected_rails.size());
+            railSelectionIndex(base_offset, desc_idx, batched, selected_rails.size());
         const size_t rail_id = selected_rails[rail_sel_idx];
         // The remote endpoint round-robins over its own count, which can differ from the
         // local rail count.
         const size_t remote_ep_id = remote_selected_endpoints[railSelectionIndex(
-            base_offset, desc_idx, batch_write, remote_selected_endpoints.size())];
-        const uint64_t fi_flags = (batch_write && apply_fi_more) ? FI_MORE : 0;
+            base_offset, desc_idx, batched, remote_selected_endpoints.size())];
+        const bool fi_more = batched && apply_fi_more &&
+            (op_type == nixlLibfabricReq::WRITE || transfer_size < READ_FI_MORE_MAX_LENGTH);
+        const uint64_t fi_flags = fi_more ? FI_MORE : 0;
         NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
         // Allocate request
         nixlLibfabricReq *req = rails_[rail_id]->allocateDataRequest(op_type, xfer_id);

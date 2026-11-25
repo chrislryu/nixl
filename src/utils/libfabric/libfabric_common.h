@@ -48,7 +48,8 @@
 #define LF_EP_NAME_MAX_LEN 56
 #define NIXL_LIBFABRC_DEFAULT_POST_QUEUE_SIZE (32 * 1024) // 32K MPSC entries
 
-// Number of consecutive WRITE descriptors batched onto one rail with FI_MORE before flushing.
+// Number of consecutive WRITE or READ descriptors batched onto one rail with FI_MORE before
+// flushing.
 #define NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE 16
 // Default of pt_group_ep_lock: 1 takes a rail's endpoint lock once per FI_MORE group of posts
 // on the progress thread, 0 once per post

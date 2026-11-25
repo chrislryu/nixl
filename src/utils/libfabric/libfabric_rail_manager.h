@@ -138,12 +138,16 @@ public:
         return rails_.size();
     }
 
+    /** READs of this many bytes or more are posted without FI_MORE: a large READ is not worth
+     *  holding until its group's doorbell. Smaller READs are batched like WRITEs. */
+    static constexpr size_t READ_FI_MORE_MAX_LENGTH = 64 * 1024;
+
     /** Round-robin index of a descriptor into a selection array of `count` entries.
-     * batch_write groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
+     * batched groups NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE consecutive descriptors per entry.
      * The FI_MORE flush precompute and the rail selection must agree, so both call this. */
     static size_t
-    railSelectionIndex(size_t base_offset, int desc_idx, bool batch_write, size_t count) {
-        const size_t rr_idx = batch_write ?
+    railSelectionIndex(size_t base_offset, int desc_idx, bool batched, size_t count) {
+        const size_t rr_idx = batched ?
             (base_offset + static_cast<size_t>(desc_idx) / NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE) :
             (base_offset + static_cast<size_t>(desc_idx));
         return rr_idx % count;
@@ -221,8 +225,9 @@ public:
      * @param submitted_count_out Number of requests successfully submitted
      * @param desc_idx Index of current descriptor within the transfer
      * @param base_offset Pre-reserved round-robin offset from reserveBaseOffset()
-     * @param apply_fi_more Precomputed by the caller: true keeps a non-striped WRITE batched
-     *        (posted with FI_MORE); false flushes the rail's batch. The caller passes false for
+     * @param apply_fi_more Precomputed by the caller: true keeps a non-striped WRITE, or a READ
+     *        shorter than READ_FI_MORE_MAX_LENGTH, batched (posted with FI_MORE); false flushes
+     *        the rail's batch. The caller passes false for
      *        a rail's last post and when a batch reaches NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE.
      *        Defaults to false so an unmarked descriptor flushes safely.
      * @param device_id Device id when multi-GPU is enabled.
