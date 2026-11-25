@@ -119,6 +119,17 @@ if get_option('buildtype') != 'release'
 
     test('completion_batch_test', completion_batch_test_bin)
 
+    # nixlLibfabricSpinLock is header-only and needs no libfabric mocks
+    spin_lock_test_bin = executable('spin_lock_test',
+               'spin_lock_test.cpp',
+               dependencies: libfabric_unit_test_deps,
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               install: true)
+
+    test('spin_lock_test', spin_lock_test_bin)
+
     # Alignment arithmetic of the CUDA dmabuf export. The helper under test is
     # header-inline and free of CUDA types, so the test runs on any host.
     libfabric_dmabuf_test_bin = executable('libfabric_dmabuf_test',

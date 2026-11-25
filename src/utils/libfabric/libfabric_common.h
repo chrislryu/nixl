@@ -22,6 +22,11 @@
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <thread>
 #include <cstring>
 #include <cassert>
 
@@ -296,6 +301,129 @@ template<typename T, typename U = T> struct pair_hash {
     operator()(const std::pair<T, U> &int_pair) const {
         return std::hash<T>()(int_pair.first) ^ std::hash<U>()(int_pair.second);
     }
+};
+
+/**
+ * @brief Test-and-test-and-set spin lock for short critical sections, which backs off to
+ * sleeping when a wait runs long.
+ *
+ * lock() tries to take the lock with one exchange. While the lock is taken, the waiter waits on
+ * plain loads, which stay in its cache until the holder's unlock invalidates the line, and only
+ * then retries the exchange. The wait backs off in three stages:
+ *  - kSpins steps with a CPU pause hint, which cover the sections this lock is for;
+ *  - kYields steps that yield the CPU, so that a holder preempted on the waiter's CPU gets to run;
+ *  - sleeps that start at kMinSleep and double up to kMaxSleep, so that a waiter on a long
+ *    section, or on a holder preempted on another CPU, gives up its CPU instead of keeping it
+ *    busy. A sleeping waiter does not use up a CPU quota either.
+ * The back-off restarts each time the waiter sees the lock free and loses the exchange to another
+ * thread, so a waiter sleeps only once the lock has looked taken through both earlier stages.
+ * unlock() is one release store and never enters the kernel, so taking and dropping a free lock
+ * costs one exchange and one store. A sleeping waiter checks the lock again when its sleep ends,
+ * so it takes the lock at most one sleep after the unlock, and no wake-up can be lost.
+ *
+ * It is not recursive: never take it again on the same thread, and never wait under it for a
+ * thread that may need it. Meets BasicLockable and Lockable, so std::lock_guard, std::unique_lock
+ * and std::scoped_lock work with it.
+ *
+ * waitStats() counts the lock() calls that found the lock taken, and the sleeps they took. The
+ * counters are written only on the wait path, so a free lock costs nothing more.
+ */
+class nixlLibfabricSpinLock {
+public:
+    struct WaitStats {
+        uint64_t waits = 0; ///< lock() calls that found the lock taken
+        uint64_t sleeps = 0; ///< sleeps those calls took
+
+        WaitStats &
+        operator+=(const WaitStats &other) noexcept {
+            waits += other.waits;
+            sleeps += other.sleeps;
+            return *this;
+        }
+    };
+
+    nixlLibfabricSpinLock() = default;
+
+    nixlLibfabricSpinLock(const nixlLibfabricSpinLock &) = delete;
+    nixlLibfabricSpinLock &
+    operator=(const nixlLibfabricSpinLock &) = delete;
+
+    void
+    lock() noexcept {
+        if (locked_.exchange(true, std::memory_order_acquire)) {
+            lockSlow();
+        }
+    }
+
+    [[nodiscard]] bool
+    try_lock() noexcept {
+        // The load keeps a polling caller from taking the line exclusive while the lock is held
+        return !locked_.load(std::memory_order_relaxed) &&
+            !locked_.exchange(true, std::memory_order_acquire);
+    }
+
+    void
+    unlock() noexcept {
+        locked_.store(false, std::memory_order_release);
+    }
+
+    [[nodiscard]] WaitStats
+    waitStats() const noexcept {
+        return {waits_.load(std::memory_order_relaxed), sleeps_.load(std::memory_order_relaxed)};
+    }
+
+private:
+    // 128 pause hints last from well under a microsecond to several microseconds, depending on
+    // the CPU: far longer than the sections this lock is for, and comparable to a context switch.
+    static constexpr size_t kSpins = 128;
+    // A yield returns at once when no other thread is waiting for the CPU, so these take from a
+    // few to tens of microseconds. Then the waiter sleeps.
+    static constexpr size_t kYields = 32;
+    // The kernel's default timer slack lengthens a short sleep by up to 50 us, so asking for less
+    // gains nothing. kMaxSleep bounds how late a waiter on a long section takes the lock.
+    static constexpr std::chrono::microseconds kMinSleep{50};
+    static constexpr std::chrono::microseconds kMaxSleep{1000};
+
+    // Out of line and cold, so lock() stays one exchange and a branch where it is inlined
+    [[gnu::noinline, gnu::cold]] void
+    lockSlow() noexcept {
+        waits_.fetch_add(1, std::memory_order_relaxed);
+        do {
+            // Restart the back-off whenever the lock was seen free: the waiter sleeps only once
+            // the lock has looked taken through the spins and yields.
+            size_t steps = 0;
+            std::chrono::microseconds sleep = kMinSleep;
+            while (locked_.load(std::memory_order_relaxed)) {
+                if (steps < kSpins) {
+                    ++steps;
+                    cpuRelax();
+                } else if (steps < kSpins + kYields) {
+                    ++steps;
+                    std::this_thread::yield();
+                } else {
+                    sleeps_.fetch_add(1, std::memory_order_relaxed);
+                    std::this_thread::sleep_for(sleep);
+                    sleep = std::min(sleep * 2, kMaxSleep);
+                }
+            }
+        } while (locked_.exchange(true, std::memory_order_acquire));
+    }
+
+    static void
+    cpuRelax() noexcept {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        // ISB rather than YIELD: YIELD is a no-op on many Arm cores, ISB stalls briefly as PAUSE
+        __asm__ __volatile__("isb" ::: "memory");
+#endif
+    }
+
+    static_assert(std::atomic<bool>::is_always_lock_free, "the spin lock needs a lock-free flag");
+
+    std::atomic<bool> locked_{false};
+    std::atomic<uint64_t> waits_{0};
+    std::atomic<uint64_t> sleeps_{0};
 };
 
 // Global XFER_ID management

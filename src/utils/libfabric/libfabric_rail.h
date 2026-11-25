@@ -142,6 +142,10 @@ public:
     size_t
     getPoolUtilization() const;
 
+    /** Waits on the pool's lock so far (see nixlLibfabricSpinLock::waitStats()) */
+    nixlLibfabricSpinLock::WaitStats
+    lockWaitStats() const;
+
     /** Expand pool by doubling its size - virtual method for subclass implementation */
     virtual nixl_status_t
     expandPool() = 0;
@@ -169,7 +173,14 @@ protected:
     mutable std::stack<size_t> free_indices_; ///< Stack of available request indices
     size_t rail_id_; ///< Rail ID for this pool
     size_t initial_pool_size_; ///< Original pool size for expansion calculations
-    mutable std::mutex pool_mutex_; ///< Thread safety protection
+
+    // Guards requests_, free_indices_ and every change of a request's in_use flag. With the
+    // progress thread on, the posting thread allocates data requests and the progress thread
+    // releases them, so the lock passes between the two on every operation. A holder only moves
+    // an index and resets a few fields, so this is a spin lock: its waiters spin before they
+    // sleep, where a mutex's waiters sleep in the kernel at once. expandPool() also runs under it
+    // (see allocateReq()). Nothing under it calls back into a pool.
+    mutable nixlLibfabricSpinLock pool_mutex_;
 };
 
 /** Buffer chunk structure for control request pool */
@@ -727,6 +738,10 @@ private:
     // FI_AV_TABLE). Written at connection setup, read on the completion path.
     mutable std::vector<uint32_t> src_addr_to_agent_;
     mutable std::shared_mutex src_addr_mutex_;
+
+    // Logs the waits on this rail's spin locks, at info level if a waiter slept, else at debug
+    void
+    logLockWaits() const;
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;

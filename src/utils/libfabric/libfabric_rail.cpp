@@ -26,6 +26,7 @@
 #endif
 
 #include <cstring>
+#include <sstream>
 #include <stdexcept>
 #include <stack>
 
@@ -92,7 +93,11 @@ RequestPool::release(nixlLibfabricReq *req) const {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Declared before the lock guard, so it is destroyed after the lock is released: a control
+    // request's callback may own captured state, and freeing that does not belong under a spin
+    // lock.
+    std::function<void(nixl_status_t)> callback;
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
 
     // GUARD: Check if already released
     if (!req->in_use) {
@@ -108,7 +113,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
     req->xfer_id = 0;
     req->chunk_offset = 0;
     req->chunk_size = 0;
-    req->completion_callback = nullptr;
+    callback.swap(req->completion_callback); // leaves the request's callback empty
     req->completion_sink = nullptr;
     memset(&req->ctx, 0, sizeof(fi_context));
 
@@ -127,21 +132,30 @@ RequestPool::release(nixlLibfabricReq *req) const {
 
 size_t
 RequestPool::getActiveRequestCount() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
     return requests_.size() - free_indices_.size();
+}
+
+nixlLibfabricSpinLock::WaitStats
+RequestPool::lockWaitStats() const {
+    return pool_mutex_.waitStats();
 }
 
 size_t
 RequestPool::getPoolUtilization() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
     return ((requests_.size() - free_indices_.size()) * 100) / requests_.size();
 }
 
 nixlLibfabricReq *
 RequestPool::allocateReq(uint32_t req_id) {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    std::lock_guard<nixlLibfabricSpinLock> lock(pool_mutex_);
 
     if (free_indices_.empty()) {
+        // Expanding under the spin lock is rare: the pool never shrinks, so it grows only when
+        // the number of requests in flight passes its size. A control pool expansion registers
+        // a new buffer chunk (fi_mr_reg) and holds the lock for that long. Waiters spin and
+        // yield only briefly, then sleep until it ends, as they did on a mutex.
         size_t old_size = requests_.size();
 
         // Try to expand the pool using the derived class implementation
@@ -699,7 +713,27 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
 }
 
 nixlLibfabricRail::~nixlLibfabricRail() {
+    logLockWaits();
     cleanup();
+}
+
+void
+nixlLibfabricRail::logLockWaits() const {
+    // A lock() that found a lock taken is normal and brief. One that slept waited for more than
+    // its spins and yields: a long section, or a holder that lost its CPU.
+    const nixlLibfabricSpinLock::WaitStats control = control_request_pool_.lockWaitStats();
+    const nixlLibfabricSpinLock::WaitStats data = data_request_pool_.lockWaitStats();
+    if (control.waits == 0 && data.waits == 0) {
+        return;
+    }
+    std::ostringstream msg;
+    msg << "Rail " << rail_id << " lock waits (waits/sleeps): control pool " << control.waits << "/"
+        << control.sleeps << ", data pool " << data.waits << "/" << data.sleeps;
+    if (control.sleeps + data.sleeps > 0) {
+        NIXL_INFO << msg.str();
+    } else {
+        NIXL_DEBUG << msg.str();
+    }
 }
 
 bool
