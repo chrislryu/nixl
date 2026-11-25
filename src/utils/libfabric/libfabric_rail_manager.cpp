@@ -427,7 +427,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
     size_t base_offset,
     bool apply_fi_more,
     int device_id,
-    bool is_cuda_vram) {
+    bool is_cuda_vram,
+    nixlLibfabricPostStager *stager) {
     // Initialize output parameter
     submitted_count_out = 0;
 
@@ -491,7 +492,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                  device_id,
                                  is_cuda_vram,
                                  rail_id,
-                                 req);
+                                 req,
+                                 stager);
             status = NIXL_SUCCESS;
         } else if (op_type == nixlLibfabricReq::WRITE) {
             // Direct post (PT OFF path)
@@ -586,7 +588,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                      device_id,
                                      is_cuda_vram,
                                      rail_id,
-                                     req);
+                                     req,
+                                     stager);
                 status = NIXL_SUCCESS;
             } else if (op_type == nixlLibfabricReq::WRITE) {
                 // Generate next SEQ_ID for this specific transfer operation
@@ -640,7 +643,8 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
                                                int device_id,
                                                bool is_cuda_vram,
                                                size_t rail_id,
-                                               nixlLibfabricReq *req) {
+                                               nixlLibfabricReq *req,
+                                               nixlLibfabricPostStager *stager) {
     uint8_t seq_id = (op_type == nixlLibfabricReq::WRITE) ? LibfabricUtils::getNextSeqId() : 0;
     uint64_t imm_data = (op_type == nixlLibfabricReq::WRITE) ?
         NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, xfer_id, seq_id) :
@@ -659,7 +663,95 @@ nixlLibfabricRailManager::deferTransferRequest(nixlLibfabricReq::OpType op_type,
     pr.fi_flags = fi_flags;
     pr.device_id = device_id;
     pr.is_cuda_vram = is_cuda_vram;
-    rails_[rail_id]->enqueuePost(pr);
+    if (stager != nullptr) {
+        stager->post(rail_id, pr);
+    } else {
+        rails_[rail_id]->enqueuePost(pr);
+    }
+}
+
+/****************************************
+ * Post stager
+ ****************************************/
+
+nixlLibfabricPostStager::ThreadStages &
+nixlLibfabricPostStager::threadStages() noexcept {
+    // Destroyed at thread exit. The plugin manager opens plugins with RTLD_NODELETE, so the
+    // destructor stays mapped.
+    static thread_local ThreadStages thread_stages;
+    return thread_stages;
+}
+
+void
+nixlLibfabricPostStager::bind() noexcept {
+    ThreadStages &thread_stages = threadStages();
+    if (thread_stages.held) {
+        direct_ = true;
+        return;
+    }
+    const size_t num_rails = rail_manager_.getNumRails();
+    if (thread_stages.stages.size() < num_rails) {
+        try {
+            thread_stages.stages.resize(num_rails);
+        }
+        catch (const std::exception &e) {
+            // Staging is only an optimization: post at once rather than fail the post
+            NIXL_WARN << "Cannot allocate post stages for " << num_rails
+                      << " rails, posting without staging: " << e.what();
+            direct_ = true;
+            return;
+        }
+    }
+    thread_stages.held = true;
+    stages_ = &thread_stages.stages;
+}
+
+void
+nixlLibfabricPostStager::pushStage(nixlLibfabricRail &rail, Stage &stage) noexcept {
+    if (stage.count == 0) {
+        return;
+    }
+    rail.enqueuePosts(stage.posts.data(), stage.count);
+    stage.group_open = (stage.posts[stage.count - 1].fi_flags & FI_MORE) != 0;
+    stage.count = 0;
+}
+
+void
+nixlLibfabricPostStager::post(size_t rail_id, const nixlLibfabricPostRequest &pr) noexcept {
+    if (stages_ == nullptr && !direct_) {
+        bind();
+    }
+    if (direct_) {
+        rail_manager_.getRail(rail_id).enqueuePost(pr);
+        return;
+    }
+    Stage &stage = (*stages_)[rail_id];
+    if (pr.length >= DIRECT_POST_MIN_LENGTH || stage.group_open) {
+        // The staged posts go first, to keep the rail's order
+        nixlLibfabricRail &rail = rail_manager_.getRail(rail_id);
+        pushStage(rail, stage);
+        rail.enqueuePost(pr);
+        stage.group_open = (pr.fi_flags & FI_MORE) != 0;
+        return;
+    }
+    stage.posts[stage.count++] = pr;
+    if (stage.count == STAGE_SIZE) {
+        pushStage(rail_manager_.getRail(rail_id), stage);
+    }
+}
+
+nixlLibfabricPostStager::~nixlLibfabricPostStager() {
+    if (stages_ == nullptr) {
+        return;
+    }
+    // Only this rail manager's rails: the stages may have grown for one with more rails, and
+    // its stager pushed them all
+    for (size_t rail_id = 0; rail_id < rail_manager_.getNumRails(); ++rail_id) {
+        Stage &stage = (*stages_)[rail_id];
+        pushStage(rail_manager_.getRail(rail_id), stage);
+        stage.group_open = false;
+    }
+    threadStages().held = false;
 }
 
 bool

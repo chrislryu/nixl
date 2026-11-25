@@ -1386,6 +1386,13 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
         }
     }
 
+    // With the progress thread on, the posts go to the rails' post rings through the stager:
+    // a rail's small posts are staged and pushed together. The stager pushes what is still
+    // staged when it goes out of scope, so every return and exception below leaves nothing
+    // staged. On the thread pool each worker runs this function, and so pushes its own posts
+    // before its chunk is counted as done.
+    nixlLibfabricPostStager stager(rail_manager_);
+
     for (int desc_idx = start_idx; desc_idx < end_idx; ++desc_idx) {
         const int rail_id = batch_writes ? batchingRail(local, desc_idx, xfer_base_offset) : -1;
         const bool apply_fi_more =
@@ -1436,7 +1443,8 @@ nixlLibfabricEngine::postXferDescriptors(nixlLibfabricReq::OpType op_type,
                                                    xfer_base_offset,
                                                    apply_fi_more,
                                                    local[desc_idx].devId,
-                                                   is_cuda_vram);
+                                                   is_cuda_vram,
+                                                   &stager);
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx

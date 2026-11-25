@@ -325,6 +325,7 @@ operator<<(std::ostream &os, const ConnectionState &state) {
  * Multiple producer threads (postXfer) push concurrently.
  * Single consumer (progress thread) pops and posts.
  * Uses fetch-add on head for multi-producer safety and freedom to execute in parallel.
+ * pushBatch() reserves the slots of several items with one fetch-add.
  * Every push writes head's cache line, so the consumer keeps its own copy of head and loads head
  * again only once it has consumed every slot up to that copy, not on every pop.
  */
@@ -425,6 +426,35 @@ public:
         ring_[head] = item;
         // Signal that this slot is written (use a separate committed array)
         committed_[head].store(true, std::memory_order_release);
+    }
+
+    /**
+     * @brief Push n items, in order, into n consecutive slots reserved with one fetch-add.
+     *
+     * Costs one fetch-add on head and, when the ring has room for all n, one load of tail,
+     * where n calls to push() cost n of each. No other producer's item lands between the n.
+     * Each slot is written as soon as the consumer has freed it, as push() does for its one
+     * slot. Slot i of the batch needs only the consumer to be past slot i - capacity, and every
+     * slot before it is an earlier producer's or already written, so n may exceed the free
+     * space and even the capacity: the consumer pops the first slots while the last ones wait.
+     */
+    void
+    pushBatch(const T *items, size_t n) {
+        if (n == 0) {
+            return;
+        }
+        size_t absHead = head_.fetch_add(n, std::memory_order_relaxed);
+        size_t absTail = tail_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) {
+            const size_t absSlot = absHead + i;
+            while (absSlot - absTail >= capacity_) {
+                std::this_thread::yield();
+                absTail = tail_.load(std::memory_order_acquire);
+            }
+            const size_t slot = absSlot % capacity_;
+            ring_[slot] = items[i];
+            committed_[slot].store(true, std::memory_order_release);
+        }
     }
 
     bool
@@ -625,6 +655,10 @@ public:
     /** Enqueue a post request for the progress thread to execute */
     void
     enqueuePost(const nixlLibfabricPostRequest &req);
+
+    /** Enqueue count post requests, in order, with one reservation in the post ring */
+    void
+    enqueuePosts(const nixlLibfabricPostRequest *reqs, size_t count);
 
     /** Drain pending posts (called by progress thread) */
     nixl_status_t

@@ -18,6 +18,7 @@
 #ifndef NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_MANAGER_H
 #define NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_MANAGER_H
 
+#include <array>
 #include <vector>
 #include <memory>
 #include <unordered_map>
@@ -39,6 +40,7 @@
 // Forward declarations
 class nixlLibfabricTopology;
 class nixlLibfabricRailManager;
+class nixlLibfabricPostStager;
 
 /** @brief Rail selection policy parent interface type. */
 class nixlLibfabricRailSelectionPolicy {
@@ -225,6 +227,8 @@ public:
      *        Defaults to false so an unmarked descriptor flushes safely.
      * @param device_id Device id when multi-GPU is enabled.
      * @param is_cuda_device Specifies whether this is CUDA-VRAM transfer.
+     * @param stager With the progress thread on, stages the posts for the rails' post rings
+     *        (see nixlLibfabricPostStager); nullptr pushes each post to its ring at once.
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
@@ -245,8 +249,11 @@ public:
                              size_t base_offset,
                              bool apply_fi_more = false,
                              int device_id = -1,
-                             bool is_cuda_vram = false);
+                             bool is_cuda_vram = false,
+                             nixlLibfabricPostStager *stager = nullptr);
 
+    /** Hand req's post to the progress thread: stage it in stager, a stager of this rail
+     *  manager, or push it to the rail's post ring at once when stager is nullptr */
     void
     deferTransferRequest(nixlLibfabricReq::OpType op_type,
                          uint16_t xfer_id,
@@ -255,7 +262,8 @@ public:
                          int device_id,
                          bool is_cuda_vram,
                          size_t rail_id,
-                         nixlLibfabricReq *req);
+                         nixlLibfabricReq *req,
+                         nixlLibfabricPostStager *stager = nullptr);
 
     /** Reserve a base offset for a transfer to ensure stable rail assignment
      *  across all descriptors in the transfer. Call once per postXfer. */
@@ -465,6 +473,83 @@ private:
         nixlSerDes &ser_des,
         const std::string &key_prefix,
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints_out) const;
+};
+
+/**
+ * @brief Stages a thread's data posts for the progress thread per rail, and pushes a rail's
+ * staged posts to its post ring with one reservation (MpscRing::pushBatch()).
+ *
+ * Create one on the stack around a posting loop and pass it to prepareAndSubmitTransfer(). A
+ * rail's posts reach its ring in the order they were posted to the stager:
+ *  - A rail's stage is pushed when it holds STAGE_SIZE posts.
+ *  - A post of DIRECT_POST_MIN_LENGTH bytes or more pushes its rail's stage and then itself, so
+ *    a large op never waits in a stage.
+ *  - The destructor pushes every stage, so no post stays staged past the scope, whether it
+ *    ends in a return, an error return or an exception.
+ *  - A post with FI_MORE rings no doorbell, so a group of them waits for the group's last
+ *    post, the one without FI_MORE. When the stager's last push to a rail ends on an FI_MORE
+ *    post, the rail's next posts go to the ring at once until one without FI_MORE has gone. A
+ *    group's last post is therefore never staged while its group's other posts wait in the
+ *    ring.
+ *
+ * The stages are thread-local and reused by the thread's next stager, so staging allocates
+ * only while they grow to the rail count. One stager per thread holds them at a time; a second
+ * stager alive on the same thread pushes its posts at once. Use and destroy a stager on the
+ * thread that created it.
+ */
+class nixlLibfabricPostStager {
+public:
+    /** Posts a rail's stage holds before it is pushed */
+    static constexpr size_t STAGE_SIZE = 64;
+    /** Posts of this many bytes or more are pushed at once, never staged */
+    static constexpr size_t DIRECT_POST_MIN_LENGTH = 64 * 1024;
+
+    explicit nixlLibfabricPostStager(nixlLibfabricRailManager &rail_manager) noexcept
+        : rail_manager_(rail_manager) {}
+
+    /** Pushes every post still staged */
+    ~nixlLibfabricPostStager();
+
+    nixlLibfabricPostStager(const nixlLibfabricPostStager &) = delete;
+    nixlLibfabricPostStager &
+    operator=(const nixlLibfabricPostStager &) = delete;
+    nixlLibfabricPostStager(nixlLibfabricPostStager &&) = delete;
+    nixlLibfabricPostStager &
+    operator=(nixlLibfabricPostStager &&) = delete;
+
+    /** Stage pr for the post ring of rail rail_id, or push it (see the class comment) */
+    void
+    post(size_t rail_id, const nixlLibfabricPostRequest &pr) noexcept;
+
+private:
+    struct Stage {
+        size_t count = 0;
+        // The last post pushed to the ring from here had FI_MORE: post at once until a post
+        // without FI_MORE has been pushed. Set only while the stage is empty.
+        bool group_open = false;
+        std::array<nixlLibfabricPostRequest, STAGE_SIZE> posts;
+    };
+
+    struct ThreadStages {
+        std::vector<Stage> stages;
+        bool held = false; // a live stager of the thread uses stages
+    };
+
+    static ThreadStages &
+    threadStages() noexcept;
+
+    /** Take the thread's stages, or set direct_ if another stager holds them */
+    void
+    bind() noexcept;
+
+    void
+    pushStage(nixlLibfabricRail &rail, Stage &stage) noexcept;
+
+    nixlLibfabricRailManager &rail_manager_;
+    // The thread's stages, from the first post on; nullptr before it and when direct_ is set
+    std::vector<Stage> *stages_ = nullptr;
+    // Every post goes to the ring at once: the thread's stages were held or could not grow
+    bool direct_ = false;
 };
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_RAIL_MANAGER_H

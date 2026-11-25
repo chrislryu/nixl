@@ -130,6 +130,24 @@ if get_option('buildtype') != 'release'
 
     test('spin_lock_test', spin_lock_test_bin)
 
+    # Staging of the progress thread's posts per rail, drained into a fake endpoint
+    post_stager_test_link_args = [
+        '-Wl,--wrap=fi_getinfo',
+        '-Wl,--wrap=numa_max_node',
+        '-Wl,--wrap=numa_num_configured_nodes',
+        '-Wl,--wrap=fi_fabric' ]
+
+    post_stager_test_bin = executable('post_stager_test',
+               'post_stager_test.cpp',
+               dependencies: libfabric_unit_test_deps,
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               link_args: post_stager_test_link_args,
+               install: true)
+
+    test('post_stager_test', post_stager_test_bin)
+
     # The request pool's allocate and release sides, under an allocating and a releasing
     # thread. A data pool calls no libfabric function, so nothing is wrapped.
     request_pool_test_bin = executable('request_pool_test',
