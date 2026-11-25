@@ -142,6 +142,18 @@ if get_option('buildtype') != 'release'
 
     test('request_pool_test', request_pool_test_bin)
 
+    # The post ring, with four producers and one consumer. The ring is header-only, so nothing
+    # is wrapped.
+    mpsc_ring_test_bin = executable('mpsc_ring_test',
+               'mpsc_ring_test.cpp',
+               dependencies: libfabric_unit_test_deps,
+               include_directories: [nixl_inc_dirs, utils_inc_dirs],
+               link_with: libfabric_utils_lib,
+               cpp_args: libfabric_test_cpp_args,
+               install: true)
+
+    test('mpsc_ring_test', mpsc_ring_test_bin)
+
     # Alignment arithmetic of the CUDA dmabuf export. The helper under test is
     # header-inline and free of CUDA types, so the test runs on any host.
     libfabric_dmabuf_test_bin = executable('libfabric_dmabuf_test',

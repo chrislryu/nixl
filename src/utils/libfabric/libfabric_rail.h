@@ -325,10 +325,18 @@ operator<<(std::ostream &os, const ConnectionState &state) {
  * Multiple producer threads (postXfer) push concurrently.
  * Single consumer (progress thread) pops and posts.
  * Uses fetch-add on head for multi-producer safety and freedom to execute in parallel.
+ * Every push writes head's cache line, so the consumer keeps its own copy of head and loads head
+ * again only once it has consumed every slot up to that copy, not on every pop.
  */
 template<typename T> class MpscRing {
 public:
-    MpscRing() : head_(0), tail_(0), capacity_(0), ring_(nullptr), committed_(nullptr) {}
+    MpscRing()
+        : head_(0),
+          tail_(0),
+          cached_head_(0),
+          capacity_(0),
+          ring_(nullptr),
+          committed_(nullptr) {}
 
     MpscRing(const MpscRing &) = delete;
     MpscRing(MpscRing &&) = delete;
@@ -371,6 +379,10 @@ public:
             committed_[i].store(false, std::memory_order_relaxed);
         }
         capacity_ = capacity;
+        // Start empty, with the consumer's copy of head equal to head
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
+        cached_head_ = 0;
         return true;
     }
 
@@ -387,6 +399,7 @@ public:
         capacity_ = 0;
         head_ = 0;
         tail_ = 0;
+        cached_head_ = 0;
     }
 
     void
@@ -417,10 +430,18 @@ public:
     bool
     pop(T &item) {
         size_t absTail = tail_.load(std::memory_order_relaxed);
-        size_t absHead = head_.load(std::memory_order_acquire);
-        if (absTail == absHead) {
-            return false;
+        if (absTail == cached_head_) {
+            // Every slot up to the copy of head is consumed, so load head again. Store the copy
+            // only when head has moved: polling an empty ring then writes nothing to the line
+            // that producers read tail from.
+            size_t absHead = head_.load(std::memory_order_acquire);
+            if (absTail == absHead) {
+                return false;
+            }
+            cached_head_ = absHead;
         }
+        // The copy of head only lags head, so this slot is reserved. Its committed flag still
+        // tells whether the producer has written it.
         size_t tail = absTail % capacity_;
         // Wait for the slot to be committed (producer might still be writing)
         // NOTE: we can actually peek entries ahead if head > tail + 1, but that would require
@@ -439,7 +460,8 @@ public:
     bool
     empty() const {
         // NOTE: we don't care about order here, as long as both head and tail are loaded by the
-        // time we compare them
+        // time we compare them. This reads head itself, not the consumer's copy, so any thread
+        // may call it.
         size_t absTail = tail_.load(std::memory_order_relaxed);
         size_t absHead = head_.load(std::memory_order_relaxed);
 
@@ -451,6 +473,9 @@ public:
 private:
     alignas(64) std::atomic<size_t> head_;
     alignas(64) std::atomic<size_t> tail_;
+    // The consumer's copy of head_, on the line of tail_, which only the consumer writes. It is
+    // always a value head_ has had, so it never runs ahead of head_.
+    size_t cached_head_;
     size_t capacity_;
     T *ring_;
     std::atomic<bool> *committed_;
