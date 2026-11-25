@@ -863,6 +863,11 @@ nixlLibfabricRail::setProgressThreadEnabled(bool enabled) {
 }
 
 void
+nixlLibfabricRail::setGroupEpLock(bool enabled) {
+    group_ep_lock_ = enabled;
+}
+
+void
 nixlLibfabricRail::addVramDevice(int device_id) {
     if (device_id < 0) {
         return;
@@ -1537,6 +1542,17 @@ nixlLibfabricRail::drainPostQueue() {
     int current_cuda_device = -1;
 #endif
 
+    // The endpoint lock. A post takes it unless it is held. With group_ep_lock_, a post with
+    // FI_MORE that went out keeps it for the next post, so an FI_MORE group takes it once; in
+    // between, only the ring is popped and the next message built. Everything else in the loop
+    // runs without it (see ep_mutex_), after release_ep_lock().
+    std::unique_lock<nixlLibfabricSpinLock> ep_lock(ep_mutex_, std::defer_lock);
+    const auto release_ep_lock = [&ep_lock] {
+        if (ep_lock.owns_lock()) {
+            ep_lock.unlock();
+        }
+    };
+
     // drain the queue up to configured limit,
     // to ensure requests from other rails do not wait too much time
     size_t post_req_count = 0;
@@ -1550,12 +1566,14 @@ nixlLibfabricRail::drainPostQueue() {
             // is postponsed to another PR, which requires substantial refactoring - instead we
             // directly call cudaSetDevice() when needed
             if (!cuda_ctx_applied || pr.device_id != cuda_ctx_device) {
+                release_ep_lock();
                 use_cuda_addr_wa = false;
                 cuda_ctx_status = LibfabricUtils::cudaSetCtx(use_cuda_addr_wa);
                 cuda_ctx_applied = true;
                 cuda_ctx_device = pr.device_id;
             }
             if (cuda_ctx_status != NIXL_SUCCESS) {
+                release_ep_lock();
                 // completion is notified also for failed requests
                 // (otherwise counters would never match)
                 if (pr.req) {
@@ -1569,6 +1587,7 @@ nixlLibfabricRail::drainPostQueue() {
 
             // other-wise set cuda device before call if needed
             if (!use_cuda_addr_wa && pr.device_id != current_cuda_device) {
+                release_ep_lock();
                 cudaError_t cuda_ret = cudaSetDevice(pr.device_id);
                 if (cuda_ret != cudaSuccess) {
                     // completion is notified also for failed requests
@@ -1610,7 +1629,9 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.context = &pr.req->ctx;
                 msg.data = pr.immediate_data;
 
-                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
+                if (!ep_lock.owns_lock()) {
+                    ep_lock.lock();
+                }
                 ret = fi_writemsg(endpoint, &msg, pr.fi_flags | FI_REMOTE_CQ_DATA);
             } else {
                 struct iovec iov{};
@@ -1632,16 +1653,25 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.rma_iov_count = 1;
                 msg.context = &pr.req->ctx;
 
-                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
+                if (!ep_lock.owns_lock()) {
+                    ep_lock.lock();
+                }
                 ret = fi_readmsg(endpoint, &msg, pr.fi_flags);
             }
 
+            // Keep the lock only after a post with FI_MORE that went out: the group's next post
+            // follows. A post that returns FI_EAGAIN releases it, so the retry loop never spins
+            // with it held and the CQ read below can take it.
+            if (!group_ep_lock_ || ret != 0 || (pr.fi_flags & FI_MORE) == 0) {
+                ep_lock.unlock();
+            }
             if (ret == -FI_EAGAIN) {
                 pollForCompletions();
             }
         }
 
         if (ret != 0) {
+            // The failed post has released the endpoint lock
             NIXL_ERROR << "drainPostQueue: post failed ret=" << ret << " (" << fi_strerror(-ret)
                        << ") on rail " << rail_id;
             if (pr.req) {
@@ -1653,9 +1683,12 @@ nixlLibfabricRail::drainPostQueue() {
         }
         posted++;
         if (posted % POST_POLL_INTERLEAVE_RATIO == 0) {
+            release_ep_lock();
             pollForCompletions();
         }
     }
+    // The ring has no next post, or the drain limit is reached, possibly inside a group
+    release_ep_lock();
 
     return NIXL_SUCCESS;
 }

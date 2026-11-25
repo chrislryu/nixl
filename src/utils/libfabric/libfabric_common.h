@@ -50,6 +50,9 @@
 
 // Number of consecutive WRITE descriptors batched onto one rail with FI_MORE before flushing.
 #define NIXL_LIBFABRIC_FI_MORE_BATCH_SIZE 16
+// Default of pt_group_ep_lock: 1 takes a rail's endpoint lock once per FI_MORE group of posts
+// on the progress thread, 0 once per post
+#define NIXL_LIBFABRIC_DEFAULT_PT_GROUP_EP_LOCK 1
 
 // Request pool configuration constants
 #define NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL 4096 // SEND/RECV operations (for notifications)

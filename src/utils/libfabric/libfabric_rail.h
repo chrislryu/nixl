@@ -693,6 +693,16 @@ public:
         return progress_thread_enabled_;
     }
 
+    /**
+     * @brief Choose how drainPostQueue() takes the endpoint lock.
+     *
+     * Set before the progress thread starts. With enabled, it keeps the lock from a post with
+     * FI_MORE to the next post, so an FI_MORE group of posts takes it once (see ep_mutex_).
+     * With enabled false it takes the lock for every post.
+     */
+    void
+    setGroupEpLock(bool enabled);
+
     /** No VRAM is registered on this rail */
     static constexpr int VRAM_DEVICE_NONE = -1;
 
@@ -796,17 +806,24 @@ private:
     // PT posts data transfers and reads the CQ while the caller's thread still posts control
     // messages (postSend), so both paths must hold this lock.
     //
-    // It is a spin lock (see nixlLibfabricSpinLock): the PT takes it for every post and every
-    // CQ read, and a section is one or a few non-blocking fi_* calls, far shorter than a sleep
-    // and wake-up in the kernel. A few sections can run longer: a CQ read can run the shm
-    // provider's CUDA IPC copies for a peer on the same host, and the control path's AV insert
-    // and remove, and the MR bind, enable and close of an FI_MR_ENDPOINT provider, can enter
-    // the kernel. None of them waits for another thread. A waiter spins and yields only
-    // briefly, then sleeps, so a long section costs it little CPU, and it takes the lock at most
-    // 1 ms after the section ends.
+    // It is a spin lock (see nixlLibfabricSpinLock): the PT takes it for every CQ read and for
+    // every post, or once for an FI_MORE group of posts, and a section is one or a few
+    // non-blocking fi_* calls, far shorter than a sleep and wake-up in the kernel. A few
+    // sections can run longer: a CQ read can run the shm provider's CUDA IPC copies for a peer
+    // on the same host, and the control path's AV insert and remove, and the MR bind, enable
+    // and close of an FI_MR_ENDPOINT provider, can enter the kernel. None of them waits for
+    // another thread. A waiter spins and yields only briefly, then sleeps, so a long section
+    // costs it little CPU, and it takes the lock at most 1 ms after the section ends.
     //  - Hold it only around the fi_* calls themselves, never around an FI_EAGAIN retry loop:
     //    the thread that reaps completions (and so clears EAGAIN) needs the lock too. Log and
     //    handle errors after releasing it.
+    //  - The one exception is an FI_MORE group in drainPostQueue() (setGroupEpLock()): after a
+    //    post with FI_MORE that went out, the PT keeps the lock for the next post, and in
+    //    between only pops the post ring, which never waits, and builds the message. It
+    //    releases the lock after a post without FI_MORE and after a post that returns FI_EAGAIN
+    //    or fails, when the drain ends, and before anything else: a CQ read, a CUDA call,
+    //    failing a request, logging. A hold so spans non-blocking posts only, and at most
+    //    POST_POLL_INTERLEAVE_RATIO of them: the post/poll interleave releases it to read the CQ.
     //  - Never call a blocking fi_* function (such as fi_cq_sread) or wait for another thread
     //    under it: that thread may need the lock.
     //  - Keep it innermost: never run completion handling or callbacks while holding it,
@@ -824,6 +841,9 @@ private:
 
     // Whether a progress thread is handling CQ draining
     bool progress_thread_enabled_ = false;
+
+    // Whether drainPostQueue() holds ep_mutex_ across an FI_MORE group (see setGroupEpLock())
+    bool group_ep_lock_ = NIXL_LIBFABRIC_DEFAULT_PT_GROUP_EP_LOCK != 0;
 
     // Live VRAM registrations on this rail per CUDA device (see addVramDevice()). Written on the
     // registration path under vram_devices_mutex_; the progress path only reads vram_device_id_,

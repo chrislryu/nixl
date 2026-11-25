@@ -590,8 +590,23 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
             LibfabricUtils::getCustomIntParam(
                 getCustomParams(), "post_queue_size", post_queue_size);
 
+            // 1 lets the progress thread take a rail's endpoint lock once per FI_MORE group of
+            // posts, 0 once per post. NIXL_LIBFABRIC_PT_GROUP_EP_LOCK overrides the parameter.
+            size_t group_ep_lock = NIXL_LIBFABRIC_DEFAULT_PT_GROUP_EP_LOCK;
+            LibfabricUtils::getCustomIntParam(getCustomParams(), "pt_group_ep_lock", group_ep_lock);
+            if (group_ep_lock > 1) {
+                NIXL_WARN << "Invalid pt_group_ep_lock value " << group_ep_lock
+                          << ": expecting 0 or 1, using default "
+                          << NIXL_LIBFABRIC_DEFAULT_PT_GROUP_EP_LOCK;
+                group_ep_lock = NIXL_LIBFABRIC_DEFAULT_PT_GROUP_EP_LOCK;
+            }
+            NIXL_INFO << "Progress thread endpoint lock: "
+                      << (group_ep_lock ? "once per FI_MORE group of posts" : "once per post")
+                      << " (pt_group_ep_lock=" << group_ep_lock << ")";
+
             for (size_t i = 0; i < rail_manager_.getNumRails(); ++i) {
                 rail_manager_.getRail(i).setProgressThreadEnabled(true);
+                rail_manager_.getRail(i).setGroupEpLock(group_ep_lock != 0);
                 if (!rail_manager_.getRail(i).initPostQueue(post_queue_size)) {
                     NIXL_ERROR << "Failed to initialize post-queue for rail " << i;
                     throw std::runtime_error("Failed to initialize the rail manager: unable to "
