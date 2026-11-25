@@ -122,7 +122,11 @@ constexpr const char *NIXL_HANDSHAKE_TAG_CONN = "conn";
      (((uint64_t)(xfer_id) & NIXL_XFER_ID_MASK) << NIXL_XFER_ID_SHIFT) | \
      (((uint64_t)(seq_id) & NIXL_SEQ_ID_MASK) << NIXL_SEQ_ID_SHIFT))
 
-#define NIXL_LIBFABRIC_CQ_BATCH_SIZE 16
+// Maximum completions read per fi_cq_readfrom() call in progressCompletionQueue() and
+// pollForCompletions(). It sizes their entry and source-address arrays on the stack, 48 bytes
+// per entry. Keep it at least POST_POLL_INTERLEAVE_RATIO, so that each poll in drainPostQueue()
+// can reap as many completions as there were posts since the previous poll.
+#define NIXL_LIBFABRIC_CQ_BATCH_SIZE 64
 
 // Giga (decimal) constant
 constexpr inline uint64_t NIXL_LIBFABRIC_GIGA = 1000ull * 1000ull * 1000ull;
