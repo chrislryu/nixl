@@ -736,11 +736,24 @@ private:
     // objects and the application must serialize them. With the progress thread enabled the
     // PT posts data transfers and reads the CQ while the caller's thread still posts control
     // messages (postSend), so both paths must hold this lock.
-    //  - Hold it only around the fi_* call itself, never around an FI_EAGAIN retry loop:
-    //    the thread that reaps completions (and so clears EAGAIN) needs the lock too.
+    //
+    // It is a spin lock (see nixlLibfabricSpinLock): the PT takes it for every post and every
+    // CQ read, and a section is one or a few non-blocking fi_* calls, far shorter than a sleep
+    // and wake-up in the kernel. A few sections can run longer: a CQ read can run the shm
+    // provider's CUDA IPC copies for a peer on the same host, and the control path's AV insert
+    // and remove, and the MR bind, enable and close of an FI_MR_ENDPOINT provider, can enter
+    // the kernel. None of them waits for another thread. A waiter spins and yields only
+    // briefly, then sleeps, so a long section costs it little CPU, and it takes the lock at most
+    // 1 ms after the section ends.
+    //  - Hold it only around the fi_* calls themselves, never around an FI_EAGAIN retry loop:
+    //    the thread that reaps completions (and so clears EAGAIN) needs the lock too. Log and
+    //    handle errors after releasing it.
+    //  - Never call a blocking fi_* function (such as fi_cq_sread) or wait for another thread
+    //    under it: that thread may need the lock.
     //  - Keep it innermost: never run completion handling or callbacks while holding it,
-    //    they take other locks and may re-enter (e.g. postRecv from a recv completion).
-    mutable std::mutex ep_mutex_;
+    //    they take other locks and may re-enter (e.g. postRecv from a recv completion). The
+    //    lock is not recursive, so a re-entry would spin forever.
+    mutable nixlLibfabricSpinLock ep_mutex_;
 
     // Lock-free MPSC ring: main thread pushes, PT pops and posts
     using post_ring_t = MpscRing<nixlLibfabricPostRequest>;

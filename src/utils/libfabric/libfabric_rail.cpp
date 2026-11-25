@@ -761,13 +761,15 @@ nixlLibfabricRail::logLockWaits() const {
     // its spins and yields: a long section, or a holder that lost its CPU.
     const nixlLibfabricSpinLock::WaitStats control = control_request_pool_.lockWaitStats();
     const nixlLibfabricSpinLock::WaitStats data = data_request_pool_.lockWaitStats();
-    if (control.waits == 0 && data.waits == 0) {
+    const nixlLibfabricSpinLock::WaitStats ep = ep_mutex_.waitStats();
+    if (control.waits == 0 && data.waits == 0 && ep.waits == 0) {
         return;
     }
     std::ostringstream msg;
     msg << "Rail " << rail_id << " lock waits (waits/sleeps): control pool " << control.waits << "/"
-        << control.sleeps << ", data pool " << data.waits << "/" << data.sleeps;
-    if (control.sleeps + data.sleeps > 0) {
+        << control.sleeps << ", data pool " << data.waits << "/" << data.sleeps << ", endpoint "
+        << ep.waits << "/" << ep.sleeps;
+    if (control.sleeps + data.sleeps + ep.sleeps > 0) {
         NIXL_INFO << msg.str();
     } else {
         NIXL_DEBUG << msg.str();
@@ -1023,7 +1025,7 @@ nixlLibfabricRail::progressCompletionQueue() {
 
     // Only protect libfabric CQ hardware operations
     {
-        std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
 
         // Non-blocking read (used by progress thread or fallback)
         ret = fi_cq_readfrom(cq, completions, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
@@ -1109,7 +1111,7 @@ nixlLibfabricRail::pollForCompletions() {
     struct fi_cq_err_entry err_entry = {};
     int cq_ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         cq_ret = fi_cq_readfrom(cq, cq_buf, NIXL_LIBFABRIC_CQ_BATCH_SIZE, src_addrs);
         if (cq_ret < 0 && cq_ret != -FI_EAGAIN) {
             fi_cq_readerr(cq, &err_entry, 0);
@@ -1412,7 +1414,7 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
 
     int ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         ret = fi_recvmsg(endpoint, &msg, 0);
     }
     if (ret) {
@@ -1448,7 +1450,7 @@ nixlLibfabricRail::postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLi
     while (true) {
         // Libfabric fi_senddata call
         {
-            const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+            const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
             ret = fi_senddata(endpoint,
                               req->buffer,
                               req->buffer_size,
@@ -1603,7 +1605,7 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.context = &pr.req->ctx;
                 msg.data = pr.immediate_data;
 
-                const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
                 ret = fi_writemsg(endpoint, &msg, pr.fi_flags | FI_REMOTE_CQ_DATA);
             } else {
                 struct iovec iov{};
@@ -1625,7 +1627,7 @@ nixlLibfabricRail::drainPostQueue() {
                 msg.rma_iov_count = 1;
                 msg.context = &pr.req->ctx;
 
-                const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+                const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
                 ret = fi_readmsg(endpoint, &msg, pr.fi_flags);
             }
 
@@ -1701,7 +1703,7 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
     while (true) {
         // Libfabric fi_writemsg call (supports FI_MORE flag)
         {
-            const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+            const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
             ret = fi_writemsg(endpoint, &msg, fi_flags | FI_REMOTE_CQ_DATA);
         }
 
@@ -1777,7 +1779,7 @@ nixlLibfabricRail::postRead(void *local_buffer,
     while (true) {
         // Libfabric fi_read call
         {
-            const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+            const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
             ret = fi_read(endpoint,
                           local_buffer,
                           length,
@@ -2028,20 +2030,28 @@ nixlLibfabricRail::registerMemory(void *buffer,
     NIXL_DEBUG << "Registered on rail " << rail_id << " via "
                << (regattr_flags == 0 ? "virtual address" : "FI_MR_DMABUF");
 
-    // Only an MR bound to the endpoint (FI_MR_ENDPOINT) needs the lock.
+    // Only an MR bound to the endpoint (FI_MR_ENDPOINT) needs the lock, and only around the
+    // fi_* calls: errors are logged after it is released.
     if (info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
-        ret = fi_mr_bind(mr, &endpoint->fid, 0);
-        if (ret) {
-            NIXL_ERROR << "fi_mr_bind failed on rail " << rail_id << ": " << fi_strerror(-ret);
-            fi_close(&mr->fid);
+        int bind_ret;
+        int enable_ret = 0;
+        {
+            const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
+            bind_ret = fi_mr_bind(mr, &endpoint->fid, 0);
+            if (bind_ret == 0) {
+                enable_ret = fi_mr_enable(mr);
+            }
+            if (bind_ret || enable_ret) {
+                fi_close(&mr->fid);
+            }
+        }
+        if (bind_ret) {
+            NIXL_ERROR << "fi_mr_bind failed on rail " << rail_id << ": " << fi_strerror(-bind_ret);
             return NIXL_ERR_BACKEND;
         }
-
-        ret = fi_mr_enable(mr);
-        if (ret) {
-            NIXL_ERROR << "fi_mr_enable failed on rail " << rail_id << ": " << fi_strerror(-ret);
-            fi_close(&mr->fid);
+        if (enable_ret) {
+            NIXL_ERROR << "fi_mr_enable failed on rail " << rail_id << ": "
+                       << fi_strerror(-enable_ret);
             return NIXL_ERR_BACKEND;
         }
     }
@@ -2072,12 +2082,16 @@ nixlLibfabricRail::deregisterMemory(struct fid_mr *mr) const {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Same rule as registerMemory: only an MR bound to the endpoint needs the EP lock.
-    std::unique_lock<std::mutex> ep_lock(ep_mutex_, std::defer_lock);
-    if (info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
-        ep_lock.lock();
+    // Same rule as registerMemory: only an MR bound to the endpoint needs the EP lock, and only
+    // around fi_close().
+    int ret;
+    {
+        std::unique_lock<nixlLibfabricSpinLock> ep_lock(ep_mutex_, std::defer_lock);
+        if (info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+            ep_lock.lock();
+        }
+        ret = fi_close(&mr->fid);
     }
-    int ret = fi_close(&mr->fid);
     if (ret) {
         NIXL_ERROR << "fi_close failed on rail " << rail_id << ": " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
@@ -2103,7 +2117,7 @@ nixlLibfabricRail::insertAddress(const void *addr,
 
     int ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         ret = fi_av_insert(av, addr, 1, fi_addr_out, 0, NULL);
     }
     if (ret != 1) {
@@ -2130,7 +2144,7 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
 
     int ret;
     {
-        const std::lock_guard<std::mutex> ep_lock(ep_mutex_);
+        const std::lock_guard<nixlLibfabricSpinLock> ep_lock(ep_mutex_);
         ret = fi_av_remove(av, &fi_addr, 1, 0);
     }
     if (ret != 0) {
